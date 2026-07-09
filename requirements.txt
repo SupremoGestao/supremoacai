@@ -1,7 +1,4 @@
+streamlit
+gspread
+google-auth
 pandas
-numpy
-matplotlib
-seaborn
-openpyxl
-scikit-learn
-ipykernel
