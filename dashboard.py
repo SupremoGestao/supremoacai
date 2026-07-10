@@ -1767,10 +1767,10 @@ def construir(cli):
     _frac = _hoje.day / calendar.monthrange(_hoje.year, _hoje.month)[1]
     _dem = {x["ref"]: x["dem"] for x in estoque}
     _fsz = {x["ref"]: x["fsz"] for x in estoque}
+    litros_map, _densmed = modelo_litros(master, peso_un)
     pv = (comparar_prod_venda(dfp, info, master, mensal, _dem, _fsz, _frac,
                               _hoje.strftime("%Y-%m"), litros_map)
           if (dfp is not None and len(dfp)) else None)
-    litros_map, _densmed = modelo_litros(master, peso_un)
     return montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
                   amanha, cap_usada, diario, pv, pesoval, litros_map, peso_un)
 
