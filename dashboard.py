@@ -37,10 +37,12 @@ from logic import (
 )
 try:
     from classificacao import (CAMARA_FRIA_REFS, REPROCESSO_REFS,
-                                POLPAS_AQUI_REFS, POLPAS_LOCKFRIO_REFS)
+                                POLPAS_AQUI_REFS, POLPAS_LOCKFRIO_REFS,
+                                LITROS_UN_OVERRIDE)
 except ImportError:
     CAMARA_FRIA_REFS = REPROCESSO_REFS = set()
     POLPAS_AQUI_REFS = POLPAS_LOCKFRIO_REFS = set()
+    LITROS_UN_OVERRIDE = {}
 
 PASTA = os.path.dirname(os.path.abspath(__file__))
 _a = os.path.join(PASTA, "credenciais.json.json")
@@ -593,14 +595,16 @@ def planejar_amanha(plano, cap=CAP_DIA_BATIDAS):
     return out, round(acc, 1)
 
 
-def series_diarias(info, diario):
-    """Litros por categoria, dia a dia, no mês atual."""
+def series_diarias(litros_map, diario):
+    """Litros por categoria, dia a dia, no mês atual — mesma base do gráfico
+    mensal (litros_map: TODOS os produtos, incl. potes e overrides)."""
     dias = sorted({d for (_, d) in diario.index})
     out = {"mix": [], "cremes": [], "gelatos": []}
     for dia in dias:
         acc = {"mix": 0.0, "cremes": 0.0, "gelatos": 0.0}
-        for ref, d in info.items():
-            acc[d["grupo"]] += diario.get((ref, dia), 0) * d["litros"]
+        for ref, lm in litros_map.items():
+            if lm["cat"] in acc and lm["litros"]:
+                acc[lm["cat"]] += diario.get((ref, dia), 0) * lm["litros"]
         for g in acc:
             out[g].append(round(acc[g]))
     return dias, out
@@ -637,6 +641,10 @@ def modelo_litros(master, peso_un):
         g = _cat_vol(nome)
         if g not in ("mix", "cremes", "gelatos"):
             out[ref] = {"litros": 0.0, "cat": g}
+            continue
+        # 1) Override manual (para produtos cujo nome não tem tamanho)
+        if ref in LITROS_UN_OVERRIDE:
+            out[ref] = {"litros": float(LITROS_UN_OVERRIDE[ref]), "cat": g}
             continue
         val, uni = tamanho(nome)
         d = dens.get(g) or GRUPO_DENS[g]
@@ -710,8 +718,10 @@ def ler_producao(pl):
     return df
 
 
-def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, frac_mes, mes_atual):
+def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, frac_mes,
+                        mes_atual, litros_map=None):
     """Cruza produção realizada x vendas no mesmo período (jan/2026+)."""
+    litros_map = litros_map or {}
     pmeses = sorted(dfp["mes"].unique())
     mi = {m: i for i, m in enumerate(pmeses)}
     refs_venda = {r for (r, _) in mensal.index}
@@ -746,19 +756,21 @@ def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, fra
         g, lit = classif(row["nome"])
         i = mi[row["mes"]]
         prodUn[g][i] += row["qtd"]
-        if lit is not None:
-            prodLit[g][i] += row["qtd"] * lit
         e = porNome.setdefault(_norm(row["nome"]), {"nome": row["nome"], "cat": g, "mes": {}})
         e["mes"][row["mes"]] = e["mes"].get(row["mes"], 0) + row["qtd"]
 
     vendUn = {g: [0.0] * len(pmeses) for g in ("mix", "cremes", "gelatos")}
     vendLit = {g: [0.0] * len(pmeses) for g in ("mix", "cremes", "gelatos")}
-    for ref, d in info.items():
-        g = d["grupo"]
+    for ref, lm in litros_map.items():          # venda: TODOS os produtos (como a Demanda)
+        g = lm["cat"]
+        if g not in vendUn:
+            continue
         for m, i in mi.items():
             q = mensal.get((ref, m), 0)
+            if not q:
+                continue
             vendUn[g][i] += q
-            vendLit[g][i] += q * d["litros"]
+            vendLit[g][i] += q * (lm["litros"] or 0)
 
     dias_prod = dfp.groupby("mes")["data"].apply(lambda s: s.dt.date.nunique())
     diasProdMes = [int(dias_prod.get(m, 0)) for m in pmeses]
@@ -769,6 +781,13 @@ def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, fra
         ref = achar_ref(e["nome"])
         prodMes = [round(e["mes"].get(m, 0)) for m in pmeses]
         vendMes = [round(mensal.get((ref, m), 0)) if ref else 0 for m in pmeses]
+        # litros da produção: tamanho no nome; senão, litros do produto casado (override incl.)
+        _, lit = classif(e["nome"])
+        if lit is None and ref and ref in litros_map:
+            lit = litros_map[ref]["litros"] or None
+        if lit:
+            for m, q in e["mes"].items():
+                prodLit[e["cat"]][mi[m]] += q * lit
         if ref is None:
             naomap.append({"nome": e["nome"], "qtd": sum(prodMes)})
         if ref in info and info[ref].get("kgpb"):
@@ -782,8 +801,9 @@ def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, fra
     produtos.sort(key=lambda x: -sum(x["prodMes"]))
 
     litrosEstCat = {g: 0.0 for g in ("mix", "cremes", "gelatos")}
-    for ref, d in info.items():
-        litrosEstCat[d["grupo"]] += master.get(ref, {}).get("eat", 0) * d["litros"]
+    for ref, lm in litros_map.items():
+        if lm["cat"] in litrosEstCat and lm["litros"]:
+            litrosEstCat[lm["cat"]] += master.get(ref, {}).get("eat", 0) * lm["litros"]
     litrosEstoque = sum(litrosEstCat.values())
 
     completos = [m for m in pmeses if m != mes_atual]
@@ -824,7 +844,7 @@ def montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
     litros_map = litros_map or {}
     peso_un = peso_un or {}
     vol, polpa = series_mensais(info, master, mensal, meses12, litros_map)
-    dia_labels, dia = series_diarias(info, diario)
+    dia_labels, dia = series_diarias(litros_map, diario)
     hoje_dt = date.today()
 
     # Cards de litros: média mensal do ANO corrente (apenas meses completos).
@@ -1609,7 +1629,17 @@ return '<span style="padding:5px 11px;border-radius:20px;font-size:12px;font-wei
 function initPV(){if(!D.pv){document.getElementById('prodvenda').innerHTML='<h2 class="ttl">Produção / Venda</h2><p class="hint">Aba \"Produção\" não encontrada ou vazia.</p>';return;}
 var box=document.getElementById('pvMeses'),last=D.pv.meses.length-1;
 box.innerHTML='<span class="lbl">Meses</span>'+D.pv.meses.map((m,i)=>'<span class="chip'+(i==last?' on':'')+'" onclick="togMes('+i+',this)">'+m.slice(5,7)+'/'+m.slice(0,4)+'</span>').join('');
-pvSel=[last];rPVkpis();rPVgraf();rSaz();rPV();}
+pvSel=[last];rPVkpis();rPVgraf();rSaz();rPV();rPeso();}
+
+function rPeso(){var a=D.pesoVal||[];var tb=document.getElementById('tPeso');if(!tb)return;
+tb.innerHTML=a.length?a.map(function(x){
+var dv=x.lkg!=null?Math.abs(1/x.lkg-x.densAss)/x.densAss:0;
+var warn=(x.lkg!=null&&dv>0.15)?' <span title="densidade real difere do padrão da categoria">⚠</span>':'';
+return '<tr><td>'+x.nome+warn+'</td><td class="n">'+x.ref+'</td><td class="n">'+fmt(x.qtd)+
+'</td><td class="n">'+fmt(x.peso,1)+'</td><td class="n">'+fmt(x.kgun,2)+'</td><td class="n">'+fmt(x.litros,2)+
+'</td><td class="n">'+(x.lkg!=null?fmt(x.lkg,3):'—')+'</td></tr>';}).join('')
+:'<tr><td colspan="7" class="muted" style="padding:14px">Aba VendasPeso vazia ou sem produtos casados.</td></tr>';
+document.getElementById('cPeso').textContent=a.length?a.length+' produtos com peso medido · ⚠ = densidade real difere >15% do padrão':'';}
 
 function rCockpit(){
 var li=function(nm,val){return '<li><span>'+nm+'</span><b>'+val+'</b></li>';};
@@ -1738,7 +1768,7 @@ def construir(cli):
     _dem = {x["ref"]: x["dem"] for x in estoque}
     _fsz = {x["ref"]: x["fsz"] for x in estoque}
     pv = (comparar_prod_venda(dfp, info, master, mensal, _dem, _fsz, _frac,
-                              _hoje.strftime("%Y-%m"))
+                              _hoje.strftime("%Y-%m"), litros_map)
           if (dfp is not None and len(dfp)) else None)
     litros_map, _densmed = modelo_litros(master, peso_un)
     return montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
