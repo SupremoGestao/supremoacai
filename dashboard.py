@@ -38,11 +38,12 @@ from logic import (
 try:
     from classificacao import (CAMARA_FRIA_REFS, REPROCESSO_REFS,
                                 POLPAS_AQUI_REFS, POLPAS_LOCKFRIO_REFS,
-                                LITROS_UN_OVERRIDE)
+                                LITROS_UN_OVERRIDE, REPROCESSO_APELIDOS)
 except ImportError:
     CAMARA_FRIA_REFS = REPROCESSO_REFS = set()
     POLPAS_AQUI_REFS = POLPAS_LOCKFRIO_REFS = set()
     LITROS_UN_OVERRIDE = {}
+    REPROCESSO_APELIDOS = {}
 
 PASTA = os.path.dirname(os.path.abspath(__file__))
 _a = os.path.join(PASTA, "credenciais.json.json")
@@ -611,13 +612,17 @@ def series_diarias(litros_map, diario):
 
 
 def _cat_vol(nome):
-    n = _norm(nome)
-    if "POLPA" in n:
+    n = re.sub(r"\s+", " ", _norm(nome))
+    # Produto acabado "EM POLPA" (caixa/litro de venda, não insumo) → conta pela
+    # natureza real (mix/creme), não como polpa. Ex: "MIX DE AÇAÍ EM POLPA CX 5LTS".
+    tem_caixa = bool(re.search(r"\b(CX|CAIXA)\b", n)) or bool(re.search(r"\d+\s*(LTS|LT|L)\b", n))
+    prod_em_polpa = ("EM POLPA" in n and "INSUMO" not in n and tem_caixa)
+    if "POLPA" in n and not prod_em_polpa:
         return "polpa"
     if "GELATO" in n:
         return "gelatos"
-    if "CREME" in n or "MOUSSE" in n:
-        return "cremes"
+    if "CREME" in n or "MOUSSE" in n or "MILKSHAKE" in n or "MILK SHAKE" in n:
+        return "cremes"          # base de milkshake = base láctea, conta em cremes
     if "ACAI" in n or "MIX" in n:
         return "mix"
     return "outros"
@@ -718,6 +723,250 @@ def ler_producao(pl):
     return df
 
 
+def ler_reprocesso(pl, master):
+    """Lê a aba 'Reprocessos': B=produto, C=litragem, D=qtd, E=validade.
+    Casa o nome com o cadastro (coluna A opcional) e classifica a validade."""
+    aba = None
+    for w in pl.worksheets():
+        if "REPROCESS" in _norm(w.title):
+            aba = w.title
+            break
+    if not aba:
+        return []
+    try:
+        raw = pl.worksheet(aba).get_all_values()
+    except Exception:
+        return []
+    # localizar cabeçalho
+    hi = 0
+    for i, r in enumerate(raw[:8]):
+        if any("REPROCESS" in _norm(str(c)) or "PRODUTO" in _norm(str(c)) for c in r):
+            hi = i
+            break
+
+    def apelido_ref(nome):
+        n = _norm(nome)
+        if n in REPROCESSO_APELIDOS:
+            return REPROCESSO_APELIDOS[n]
+        for ap, ref in REPROCESSO_APELIDOS.items():   # match parcial
+            if ap in n or n in ap:
+                return ref
+        return None
+
+    hoje = date.today()
+    itens = []
+    for r in raw[hi + 1:]:
+        r = list(r) + [""] * (5 - len(r))
+        refA = _rec_num(r[0])
+        nome = str(r[1]).strip()
+        if not nome:
+            continue
+        litr = _rec_num(str(r[2]).upper().replace("LT", "").replace("L", "")) or 0  # "5lt"→5
+        qtd = _rec_num(r[3]) or 0
+        vtxt = str(r[4]).strip()
+        # validade
+        dt, situacao, dias = None, "", None
+        if _norm(vtxt) in ("TESTE", "TESTES", ""):
+            situacao = "teste"
+        else:
+            for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(vtxt, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            if dt:
+                dias = (dt - hoje).days
+                situacao = "vencido" if dias < 0 else ("vencendo" if dias <= 30 else "ok")
+            else:
+                situacao = "teste"
+        # ref: coluna A, senão apelido, senão casa por nome no master
+        ref = int(refA) if refA else apelido_ref(nome)
+        if not ref:
+            ref = casar_ref_nome(nome, master)
+        prod_cad = master.get(ref, {}).get("prod") if ref else None
+        cat = _cat_vol(prod_cad or nome)
+        itens.append({
+            "ref": ref, "nome": nome, "prodCad": prod_cad,
+            "litragem": litr, "qtd": qtd, "litros": round(litr * qtd, 1),
+            "validade": dt.strftime("%d/%m/%Y") if dt else vtxt,
+            "situacao": situacao, "dias": dias,
+            "cat": cat if cat in ("mix", "cremes", "gelatos") else "outros",
+            "eatSistema": master.get(ref, {}).get("eat") if ref else None})
+    # ordena: vencido → vencendo → ok → teste; dentro, por dias
+    ordem = {"vencido": 0, "vencendo": 1, "ok": 2, "teste": 3}
+    itens.sort(key=lambda x: (ordem.get(x["situacao"], 9),
+                              x["dias"] if x["dias"] is not None else 9999))
+    return itens
+
+
+def casar_ref_nome(nome, master):
+    """Casa um nome informal de reprocesso com uma ref de produto acabado."""
+    pt = set(tokens(nome))
+    if not pt:
+        return None
+    melhor, best = None, 0
+    for ref, m in master.items():
+        prod = m.get("prod", "")
+        n = _norm(prod)
+        if not any(k in n for k in ("MIX", "CREME", "GELATO", "MOUSSE")):
+            continue
+        if any(k in n for k in ("PLACA", "ECOBAG", "CAIXA", "RELOGIO", "CINTA",
+                                "INSUMO", "DEGUSTA", "PICOLE", "CORANTE", "TOPPING", "POTE")):
+            continue
+        pc = set(tokens(prod))
+        if not pc:
+            continue
+        inter = pt & pc
+        score = len(inter) / len(pc)
+        if score > best and len(inter) >= 2:
+            best, melhor = score, ref
+    return melhor if best >= 0.5 else None
+
+
+def ler_consumo_real(pl):
+    """Lê a aba 'Produção com insumos' e retorna CADA produção como um registro
+    individual: {mes, produto, qtd, insumos:[{ref,nome,qtd,custoUn}]}.
+    Estrutura em blocos: linha de produção (G=produto, I=data, T=qtd) seguida
+    das linhas de insumo (B=ref, E=nome, Q=custo unit, S=qtd consumida)."""
+    aba = None
+    for w in pl.worksheets():
+        n = _norm(w.title)
+        if "PRODUCAO" in n and "INSUMO" in n:
+            aba = w.title
+            break
+    if not aba:
+        return None
+    try:
+        raw = pl.worksheet(aba).get_all_values()
+    except Exception:
+        return None
+
+    def money(s):
+        s = str(s).upper().replace("R$", "").replace(".", "").replace(",", ".").strip()
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    prods = []
+    atual = None
+    for r in raw[7:]:
+        r = list(r) + [""] * 25
+        colG, colI, colT = str(r[6]).strip(), str(r[8]).strip(), str(r[19]).strip()
+        colB, colE, colQ, colS = str(r[1]).strip(), str(r[4]).strip(), str(r[16]).strip(), str(r[18]).strip()
+        # linha de produção? (data em I + produto em G)
+        if "/" in colI and colG and _norm(colG) not in ("PRODUTO",):
+            dt = None
+            for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+                try:
+                    dt = datetime.strptime(colI, fmt).date()
+                    break
+                except ValueError:
+                    dt = None
+            atual = {"mes": dt.strftime("%Y-%m") if dt else None,
+                     "produto": colG, "qtd": _rec_num(colT) or 0, "insumos": []}
+            prods.append(atual)
+            continue
+        # linha de insumo? (ref em B + nome em E)
+        cb = _rec_num(colB)
+        if cb and colE and _norm(colE) not in ("INSUMO",) and atual is not None:
+            atual["insumos"].append({"ref": int(cb), "nome": colE,
+                                     "qtd": _rec_num(colS) or 0, "custoUn": money(colQ)})
+    return prods
+
+
+def analise_real_vs_teorico(pl, master, rec_por_aba):
+    """Análise MENSAL de desperdício: para cada mês, cruza consumo REAL de insumo
+    (aba Produção com insumos) com o TEÓRICO (receita × produção realizada).
+    Dois níveis: resumo por RECEITA (qual produto desperdiça) e detalhe por INSUMO.
+    Divergência = real − teórico; >5% sinaliza perda ou receita desatualizada."""
+    prods = ler_consumo_real(pl)
+    if not prods:
+        return None
+    todas_recs = [r for recs in rec_por_aba.values() for r in recs]
+    _rec_cache = {}                 # nome_produto → receita casada (casa 1x por produto)
+
+    def teorico_da_producao(nome, qtd):
+        """Insumo esperado (ref→kg) para produzir 'qtd' unidades de 'nome'."""
+        if nome in _rec_cache:
+            rec = _rec_cache[nome]
+        else:
+            rec = casar_receita(nome, todas_recs)
+            _rec_cache[nome] = rec
+        if not rec:
+            return None, None
+        kgpb = sum(i["q1b"] for i in rec["ings"])
+        if kgpb <= 0:
+            return None, rec["titulo"]
+        val, uni = tamanho(nome)
+        g = _cat_vol(nome)
+        kgun = (val if uni == "KG" else (val * GRUPO_DENS.get(g, 0.8) if uni == "L" and val else 0))
+        if not kgun:
+            return None, rec["titulo"]
+        bat = (qtd * kgun) / kgpb
+        esp = {ing["ref"]: bat * ing["q1b"] for ing in rec["ings"] if ing["temRef"]}
+        return esp, rec["titulo"]
+
+    # agrega por mês → receita → insumo
+    meses = {}     # mes → {receitas:{titulo:{real,teo,custo,prod,ins:{ref:{nome,real,teo,custo}}}}}
+    for p in prods:
+        mes = p["mes"]
+        if not mes:
+            continue
+        esp, titulo = teorico_da_producao(p["produto"], p["qtd"])
+        titulo = titulo or p["produto"]
+        M = meses.setdefault(mes, {"receitas": {}, "custoTot": 0.0})
+        R = M["receitas"].setdefault(titulo, {"real": 0.0, "teo": 0.0, "custo": 0.0,
+                                              "prodUn": 0.0, "temRec": esp is not None,
+                                              "ins": {}})
+        R["prodUn"] += p["qtd"]
+        for it in p["insumos"]:
+            ref, kg, cu = it["ref"], it["qtd"], it["custoUn"]
+            custo = kg * cu
+            R["real"] += kg
+            R["custo"] += custo
+            M["custoTot"] += custo
+            teo = (esp or {}).get(ref, 0)
+            R["teo"] += teo
+            d = R["ins"].setdefault(ref, {"nome": it["nome"], "real": 0.0, "teo": 0.0, "custo": 0.0})
+            d["real"] += kg
+            d["custo"] += custo
+            d["teo"] += teo
+        # insumos esperados que nem apareceram no real (faltou lançar)
+        for ref, teo in (esp or {}).items():
+            if ref not in R["ins"]:
+                R["ins"][ref] = {"nome": master.get(ref, {}).get("prod", f"ref {ref}"),
+                                 "real": 0.0, "teo": teo, "custo": 0.0}
+                R["teo"] += teo
+
+    # serializa para o payload
+    out_meses = {}
+    for mes, M in meses.items():
+        receitas = []
+        for titulo, R in M["receitas"].items():
+            dif = R["real"] - R["teo"]
+            pct = (dif / R["teo"] * 100) if R["teo"] > 0 else None
+            insumos = []
+            for ref, d in R["ins"].items():
+                idif = d["real"] - d["teo"]
+                ipct = (idif / d["teo"] * 100) if d["teo"] > 0 else None
+                insumos.append({"ref": ref, "nome": d["nome"], "real": round(d["real"], 1),
+                                "teo": round(d["teo"], 1), "dif": round(idif, 1),
+                                "pct": round(ipct, 1) if ipct is not None else None,
+                                "custo": round(d["custo"], 2), "temTeo": d["teo"] > 0})
+            insumos.sort(key=lambda x: -abs(x["dif"]))
+            receitas.append({"receita": titulo, "real": round(R["real"], 1),
+                             "teo": round(R["teo"], 1), "dif": round(dif, 1),
+                             "pct": round(pct, 1) if pct is not None else None,
+                             "custo": round(R["custo"], 2), "prodUn": round(R["prodUn"]),
+                             "temRec": R["temRec"], "insumos": insumos})
+        receitas.sort(key=lambda x: -(abs(x["pct"]) if x["pct"] is not None else 0))
+        out_meses[mes] = {"receitas": receitas, "custoTot": round(M["custoTot"], 2)}
+
+    return {"meses": out_meses, "mesesLista": sorted(out_meses.keys())}
+
+
 def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, frac_mes,
                         mes_atual, litros_map=None):
     """Cruza produção realizada x vendas no mesmo período (jan/2026+)."""
@@ -732,10 +981,19 @@ def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, fra
 
     def classif(nome):
         n = _norm(nome)
-        g = "gelatos" if "GELATO" in n else ("cremes" if ("CREME" in n or "MOUSSE" in n) else "mix")
+        g = "gelatos" if "GELATO" in n else ("cremes" if ("CREME" in n or "MOUSSE" in n or "MILKSHAKE" in n or "MILK SHAKE" in n) else "mix")
+        return g
+
+    def litros_un(nome, ref):
+        """Litros por unidade — MESMA referência da venda (litros_map do produto
+        casado). Só cai na fórmula pelo nome se o produto não casar com ref."""
+        if ref and ref in litros_map and litros_map[ref]["litros"]:
+            return litros_map[ref]["litros"]
         val, uni = tamanho(nome)
-        lit = None if val is None else (val if uni == "L" else val / GRUPO_DENS[g])
-        return g, lit
+        if val is None:
+            return None
+        g = classif(nome)
+        return val if uni == "L" else val / GRUPO_DENS[g]
 
     def achar_ref(nome):
         k = _norm(nome)
@@ -753,7 +1011,7 @@ def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, fra
     prodLit = {g: [0.0] * len(pmeses) for g in ("mix", "cremes", "gelatos")}
     porNome = {}
     for _, row in dfp.iterrows():
-        g, lit = classif(row["nome"])
+        g = classif(row["nome"])
         i = mi[row["mes"]]
         prodUn[g][i] += row["qtd"]
         e = porNome.setdefault(_norm(row["nome"]), {"nome": row["nome"], "cat": g, "mes": {}})
@@ -781,10 +1039,8 @@ def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, fra
         ref = achar_ref(e["nome"])
         prodMes = [round(e["mes"].get(m, 0)) for m in pmeses]
         vendMes = [round(mensal.get((ref, m), 0)) if ref else 0 for m in pmeses]
-        # litros da produção: tamanho no nome; senão, litros do produto casado (override incl.)
-        _, lit = classif(e["nome"])
-        if lit is None and ref and ref in litros_map:
-            lit = litros_map[ref]["litros"] or None
+        # litros da produção: MESMA referência da venda (litros do produto casado)
+        lit = litros_un(e["nome"], ref)
         if lit:
             for m, q in e["mes"].items():
                 prodLit[e["cat"]][mi[m]] += q * lit
@@ -837,7 +1093,8 @@ def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, fra
 
 # ── HTML ──────────────────────────────────────────────────────────
 def montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
-           amanha, cap_usada, diario, pv=None, pesoval=None, litros_map=None, peso_un=None):
+           amanha, cap_usada, diario, pv=None, pesoval=None, litros_map=None, peso_un=None,
+           reproc=None, custos=None):
     from collections import Counter
     hoje = date.today().strftime("%d/%m/%Y")
     meses12 = meses_all[-12:]
@@ -960,7 +1217,8 @@ def montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
         "diaLabels": dia_labels, "dia": dia, "cat": cat, "meta": meta_info,
         "resumo": {"abcVal": abc_val, "abcCnt": abc_cnt, "status": stt,
                    "acao": acao_nec, "valCat": dict(valc)},
-        "cap": CAP_DIA_BATIDAS, "capUsada": cap_usada, "pv": pv, "pesoVal": pesoval or []}
+        "cap": CAP_DIA_BATIDAS, "capUsada": cap_usada, "pv": pv, "pesoVal": pesoval or [],
+        "reproc": reproc or [], "custos": custos}
     dump = json.dumps(payload, ensure_ascii=False,
                       default=lambda o: o.item() if hasattr(o, "item") else str(o))
 
@@ -1082,6 +1340,7 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <button data-t="estoque" onclick="showTab('estoque')">Estoque</button>
 <button data-t="producao" onclick="showTab('producao')">Produção</button>
 <button data-t="prodvenda" onclick="showTab('prodvenda')">Produção / Venda</button>
+<button data-t="custos" onclick="showTab('custos')">Custos</button>
 <button data-t="demanda" onclick="showTab('demanda')">Demanda</button>
 </div></div>
 <div class="wrap">
@@ -1216,11 +1475,17 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <tbody id="tSeco"></tbody></table></div><div class="cont" id="cSeco"></div></div></div>
 
 <div class="sub" id="sub-reproc" style="display:none">
-<div class="kpis" id="repKpis" style="grid-template-columns:repeat(3,1fr)"></div>
-<div class="tile"><div class="th">♻️ Reprocessos</div>
-<p class="hint" style="margin-top:0">Aguardando lista de refs de reprocesso. Envie a lista e eu preencho aqui — mesmo modelo das outras sub-abas (conferência + KPIs + WhatsApp).</p>
-<div id="repVazio" style="padding:30px;text-align:center;color:var(--mut);font-size:13px">
-Sem refs cadastradas.<br><span style="font-size:11px">Adicione as refs em <code>classificacao.py</code> → <code>REPROCESSO_REFS</code></span></div></div></div>
+<div class="kpis" id="repKpis" style="grid-template-columns:repeat(4,1fr)"></div>
+<div class="tile printarea" id="confRepTile" style="border-left:5px solid #8ba05a;background:linear-gradient(90deg,#F1F5E8,var(--card) 30%)">
+<div class="th" style="display:flex;justify-content:space-between;align-items:center">♻️ Reprocessos <small style="font-weight:600;color:var(--mut)"><b id="repDia">—</b></small></div>
+<p class="hint" style="margin-top:0">Produtos para reprocessar/realocar. 🔴 vencido · 🟡 vence ≤30d · 🟢 ok · ⚪ teste (receita nova sem cadastro). Da aba "Reprocessos" da planilha.</p>
+<div class="tablewrap" style="max-height:420px"><table><thead><tr>
+<th>Produto</th><th>Ref</th><th>Cat.</th><th>Emb.</th><th>Qtd</th><th>Litros</th><th>Validade</th><th>Situação</th></tr></thead>
+<tbody id="tReproc"></tbody></table></div>
+<div class="noprint" style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+<button class="btnp" style="background:#2A6FB0" onclick="imprimirSub('rep')">🖨 Imprimir</button>
+<button class="btnp" style="background:#25D366" onclick="whatsRep()">📱 WhatsApp</button>
+<span class="muted">Lançado na planilha — edite lá para atualizar.</span></div></div></div>
 
 <div class="sub" id="sub-todos" style="display:none">
 <div class="slic" id="chips-est"><span class="lbl">Curva</span>
@@ -1269,6 +1534,19 @@ Sem refs cadastradas.<br><span style="font-size:11px">Adicione as refs em <code>
 <tbody id="tBases"></tbody></table></div></div></section>
 
 
+<section id="custos" class="tab"><h2 class="ttl">Custos & Desperdício por Receita</h2><p class="hint">Consumo <b>real</b> de insumo (aba "Produção com insumos") vs <b>teórico</b> (ficha técnica × produção) por <b>mês</b>. Divergência acima de 5% = possível desperdício ou receita desatualizada.</p>
+<div class="slic" id="custMeses" style="margin-bottom:8px"></div>
+<div class="kpis" id="custKpis" style="grid-template-columns:repeat(4,1fr)"></div>
+<div class="slic"><span class="lbl">Mostrar</span>
+<span class="chip on" data-v="" onclick="setCust('',this)">Todas as receitas</span>
+<span class="chip" data-v="desp" onclick="setCust('desp',this)">Só desperdício (&gt;5%)</span>
+<span class="chip" data-v="semrec" onclick="setCust('semrec',this)">Sem ficha técnica</span>
+<input class="busca" id="qCust" onkeyup="rCust()" placeholder="Buscar receita…"></div>
+<div class="tile"><div class="th">Real × teórico por receita <small>· clique numa receita para ver os insumos</small></div>
+<div class="tablewrap" style="max-height:600px"><table><thead><tr>
+<th>Receita / Insumo</th><th>Real (kg)</th><th>Teórico (kg)</th><th>Diferença</th><th>% div.</th><th>Custo real (R$)</th></tr></thead>
+<tbody id="tCust"></tbody></table></div><div class="cont" id="cCust"></div></div></section>
+
 <section id="prodvenda" class="tab"><h2 class="ttl">Produção / Venda</h2><p class="hint">Produção realizada (aba Produção) × vendas, no mesmo período. Passe o mouse nos gráficos.</p>
 <div class="kpis" id="pvKpis" style="grid-template-columns:repeat(8,1fr)"></div>
 <div class="grid2"><div class="tile"><div class="th">Litros produzidos × vendidos <small>· clique na legenda para ocultar</small></div><div id="pvLine"></div></div>
@@ -1292,10 +1570,12 @@ Sem refs cadastradas.<br><span style="font-size:11px">Adicione as refs em <code>
 <th onclick="sortPV('dif')">Diferença</th><th onclick="sortPV('atend')">Atend. %</th></tr></thead>
 <tbody id="tPV"></tbody></table></div><div class="cont" id="cPV"></div></div>
 <div class="tile" id="pvNaoMapTile"><div class="th">Produzidos sem correspondência na venda <small>· conferir nome</small></div><div id="pvNaoMap"></div></div>
-<div class="tile"><div class="th">Litros por kg medido <small>· da aba VendasPeso (Peso_Total ÷ Qtd)</small></div>
-<div class="tablewrap" style="max-height:340px"><table><thead><tr>
-<th>Produto</th><th>Ref</th><th>Qtd vend.</th><th>Peso total (kg)</th><th>kg/un</th><th>Litros/un</th><th>L/kg</th></tr></thead>
-<tbody id="tPeso"></tbody></table></div><div class="cont" id="cPeso"></div></div>
+<div class="tile"><div class="th">Densidade por categoria <small>· usada para converter kg em litros</small></div>
+<div style="padding:14px;font-size:13px;color:var(--ink);line-height:1.7">
+O painel converte peso em litros usando densidades fixas, validadas com a operação:
+<b>Açaí 0,80 kg/L</b> · <b>Cremes 0,70 kg/L</b> · <b>Gelato 0,60 kg/L</b>.<br>
+<span style="color:var(--mut);font-size:12px">Ex.: um sachê de 10 kg de açaí = 10 ÷ 0,80 = <b>12,5 L</b>. Produtos com tamanho em litros no nome (CX 5L) usam o litro direto.</span>
+</div></div>
 </section>
 
 <section id="demanda" class="tab"><h2 class="ttl">Demanda</h2><p class="hint">Clique nos cartões para filtrar. Passe o mouse nos gráficos para ver o valor de cada período. <b>__VOLINFO__</b></p>
@@ -1516,9 +1796,30 @@ var r=q?all.filter(x=>(x.produto+x.ref).toLowerCase().indexOf(q)>-1):all.slice(0
 rConfSub('seco',r,'tConfSeco','secoDia','secoInfo',function(x){return '';},'');}
 
 // Reprocesso
-function rReproc(){var r=D.estoque.filter(x=>x.subEst=='reprocesso');
-var K=[['Itens',fmt(r.length),''],['Valor','R$ '+fmt(r.reduce((s,x)=>s+(x.valor||0),0),2),''],['Status','aguardando lista','']];
-document.getElementById('repKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');}
+function rReproc(){var r=D.reproc||[];
+var Ltot=0,venc=0,teste=0;r.forEach(function(x){Ltot+=x.litros||0;if(x.situacao=='vencido')venc++;if(x.situacao=='teste')teste++;});
+var K=[['Litros em reprocesso',fmt(Ltot,0)+' L',''],['Itens',fmt(r.length),''],
+['Vencidos',fmt(venc),venc?'al':''],['Em teste',fmt(teste),'']];
+document.getElementById('repKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
+if(document.getElementById('repDia'))document.getElementById('repDia').textContent=new Date().toLocaleDateString('pt-BR');
+var sinal={vencido:'🔴',vencendo:'🟡',ok:'🟢',teste:'⚪'};
+var stxt={vencido:'Vencido',vencendo:'Vence ≤30d',ok:'OK',teste:'Teste'};
+var cat=function(g){return g=='mix'?'Açaí':g=='cremes'?'Cremes':g=='gelatos'?'Gelato':'—';};
+document.getElementById('tReproc').innerHTML=r.length?r.map(function(x){
+var cor=x.situacao=='vencido'?'#C0392B':x.situacao=='vencendo'?'#B7791F':'var(--ink)';
+var dd=x.dias!=null?(x.dias<0?' ('+Math.abs(x.dias)+'d atrás)':' ('+x.dias+'d)'):'';
+return '<tr><td>'+x.nome+(x.prodCad?'<br><span style="font-size:10px;color:var(--mut)">'+x.prodCad+'</span>':'')+
+'</td><td class="n">'+(x.ref||'—')+'</td><td>'+cat(x.cat)+'</td><td class="n">'+fmt(x.litragem,0)+'L</td>'+
+'<td class="n">'+fmt(x.qtd,0)+'</td><td class="n"><b>'+fmt(x.litros,0)+'</b></td>'+
+'<td class="n">'+x.validade+dd+'</td><td style="color:'+cor+';font-weight:700">'+(sinal[x.situacao]||'')+' '+(stxt[x.situacao]||'')+'</td></tr>';}).join('')
+:'<tr><td colspan="8" class="muted" style="padding:14px">Aba "Reprocessos" vazia.</td></tr>';}
+function whatsRep(){var r=D.reproc||[];if(!r.length){alert('Sem reprocessos lançados.');return;}
+var dia=new Date().toLocaleDateString('pt-BR');var Ltot=0;
+var stxt={vencido:'VENCIDO',vencendo:'vence ≤30d',ok:'ok',teste:'teste'};
+var linhas=r.map(function(x){Ltot+=x.litros||0;
+return '• '+x.nome+' ('+fmt(x.litragem,0)+'L × '+fmt(x.qtd,0)+' = '+fmt(x.litros,0)+'L)\n   '+x.validade+' — '+(stxt[x.situacao]||'');});
+var txt='*♻️ Reprocessos — Supremo Açaí*\n'+dia+'\n\n'+linhas.join('\n')+'\n\n*Total:* '+fmt(Ltot,0)+' L em reprocesso';
+window.open('https://wa.me/?text='+encodeURIComponent(txt),'_blank');}
 
 // Conferência genérica (compartilhada por câmara, polpa lockfrio e seco)
 var CONF_KEYS={cam:'confCam',lf:'confLf',seco:'confSeco'};
@@ -1546,7 +1847,7 @@ if(sub=='cam')rCam();if(sub=='lf')rConfLf();if(sub=='seco')rConfSeco();}
 function _doPrint(elId){var el=document.getElementById(elId);if(!el){window.print();return;}
 el.classList.add('to-print');document.body.classList.add('print-only');
 setTimeout(function(){window.print();setTimeout(function(){el.classList.remove('to-print');document.body.classList.remove('print-only');},200);},80);}
-function imprimirSub(sub){var id={cam:'confCamTile',lf:'confLfTile',seco:'confSecoTile',aqui:'confAquiTile'}[sub];_doPrint(id);}
+function imprimirSub(sub){var id={cam:'confCamTile',lf:'confLfTile',seco:'confSecoTile',aqui:'confAquiTile',rep:'confRepTile'}[sub];_doPrint(id);}
 function imprimirConf(){_doPrint('confAquiTile');}
 function whatsCf(sub){
 var arr;if(sub=='cam')arr=D.estoque.filter(x=>x.subEst=='camara');
@@ -1629,17 +1930,7 @@ return '<span style="padding:5px 11px;border-radius:20px;font-size:12px;font-wei
 function initPV(){if(!D.pv){document.getElementById('prodvenda').innerHTML='<h2 class="ttl">Produção / Venda</h2><p class="hint">Aba \"Produção\" não encontrada ou vazia.</p>';return;}
 var box=document.getElementById('pvMeses'),last=D.pv.meses.length-1;
 box.innerHTML='<span class="lbl">Meses</span>'+D.pv.meses.map((m,i)=>'<span class="chip'+(i==last?' on':'')+'" onclick="togMes('+i+',this)">'+m.slice(5,7)+'/'+m.slice(0,4)+'</span>').join('');
-pvSel=[last];rPVkpis();rPVgraf();rSaz();rPV();rPeso();}
-
-function rPeso(){var a=D.pesoVal||[];var tb=document.getElementById('tPeso');if(!tb)return;
-tb.innerHTML=a.length?a.map(function(x){
-var dv=x.lkg!=null?Math.abs(1/x.lkg-x.densAss)/x.densAss:0;
-var warn=(x.lkg!=null&&dv>0.15)?' <span title="densidade real difere do padrão da categoria">⚠</span>':'';
-return '<tr><td>'+x.nome+warn+'</td><td class="n">'+x.ref+'</td><td class="n">'+fmt(x.qtd)+
-'</td><td class="n">'+fmt(x.peso,1)+'</td><td class="n">'+fmt(x.kgun,2)+'</td><td class="n">'+fmt(x.litros,2)+
-'</td><td class="n">'+(x.lkg!=null?fmt(x.lkg,3):'—')+'</td></tr>';}).join('')
-:'<tr><td colspan="7" class="muted" style="padding:14px">Aba VendasPeso vazia ou sem produtos casados.</td></tr>';
-document.getElementById('cPeso').textContent=a.length?a.length+' produtos com peso medido · ⚠ = densidade real difere >15% do padrão':'';}
+pvSel=[last];rPVkpis();rPVgraf();rSaz();rPV();}
 
 function rCockpit(){
 var li=function(nm,val){return '<li><span>'+nm+'</span><b>'+val+'</b></li>';};
@@ -1718,7 +2009,55 @@ var txt='*📋 Conferência Física de Polpas*\n*Supremo Açaí* · '+dia+'\n\n'
 '\n\n*Resumo:* '+contadas+' polpa(s) contadas · Divergência total: '+fmt(divTot,0)+' un';
 window.open('https://wa.me/?text='+encodeURIComponent(txt),'_blank');}
 
-try{rCockpit();rGeral();rCmp();rEst();rPlano();rConf();rPolpa();rMeta();rVisao();rDemGraf();rDem();initPV();}catch(e){
+var custMes='',custF='',custExp={};
+function setCust(v,el){custF=v;el.parentNode.querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');rCust();}
+function setCustMes(m){custMes=m;custExp={};document.querySelectorAll('#custMeses .chip').forEach(c=>c.classList.toggle('on',c.dataset.m==m));rCust();}
+function toggReceita(i){custExp[i]=!custExp[i];rCust();}
+function rCust(){var c=D.custos;
+if(!c||!c.mesesLista||!c.mesesLista.length){document.getElementById('custKpis').innerHTML='<div class="kpi"><div class="l">Sem dados</div><div class="v">—</div></div>';
+document.getElementById('tCust').innerHTML='<tr><td colspan="7" class="muted" style="padding:14px">Aba "Produção com insumos" não encontrada ou vazia.</td></tr>';
+document.getElementById('custMeses').innerHTML='';return;}
+if(!custMes||c.mesesLista.indexOf(custMes)<0)custMes=c.mesesLista[c.mesesLista.length-1];
+// chips de mês
+document.getElementById('custMeses').innerHTML='<span class="lbl">Mês</span>'+c.mesesLista.map(m=>'<span class="chip'+(m==custMes?' on':'')+'" data-m="'+m+'" onclick="setCustMes(\''+m+'\')">'+m.slice(5)+'/'+m.slice(0,4)+'</span>').join('');
+var M=c.meses[custMes],recs=M.receitas;
+// KPIs do mês
+var comRec=recs.filter(r=>r.temRec);
+var desp=comRec.filter(r=>r.pct!=null&&r.pct>5);       // desperdício >5%
+var custoDesp=desp.reduce((s,r)=>s+Math.max(0,r.custo*(r.pct/100)/(1+r.pct/100)),0);
+var K=[['Custo real do mês','R$ '+fmt(M.custoTot,2),''],['Receitas produzidas',fmt(recs.length),''],
+['Receitas desperdiçando &gt;5%',fmt(desp.length),desp.length?'al':''],['Perda estimada (R$)','R$ '+fmt(custoDesp,0),custoDesp>0?'al':'']];
+document.getElementById('custKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
+// filtro
+var q=(document.getElementById('qCust').value||'').toLowerCase();
+var rr=recs.filter(function(r){
+if(q&&r.receita.toLowerCase().indexOf(q)<0)return false;
+if(custF=='desp')return r.temRec&&r.pct!=null&&r.pct>5;
+if(custF=='semrec')return !r.temRec;
+return true;});
+// tabela: linha de receita (clicável) + linhas de insumo quando expandida
+var html='';
+rr.forEach(function(r,idx){
+var cor=r.pct==null?'var(--mut)':(r.pct>15?'var(--rup)':r.pct>5?'#B7791F':r.pct<-5?'#2A6FB0':'var(--ok)');
+var pcttxt=r.pct==null?'<span title="receita não cadastrada">s/ receita</span>':(r.pct>0?'+':'')+fmt(r.pct,1)+'%';
+var seta=r.temRec?(custExp[idx]?'▾':'▸'):'';
+html+='<tr style="cursor:'+(r.temRec?'pointer':'default')+';background:var(--card)" onclick="toggReceita('+idx+')">'+
+'<td><b>'+seta+' '+r.receita+'</b><br><span style="font-size:10px;color:var(--mut)">'+fmt(r.prodUn)+' un produzidas</span></td>'+
+'<td class="n">'+fmt(r.real,1)+'</td><td class="n">'+(r.temRec?fmt(r.teo,1):'—')+'</td>'+
+'<td class="n" style="color:'+cor+';font-weight:700">'+(r.temRec?(r.dif>0?'+':'')+fmt(r.dif,1):'—')+'</td>'+
+'<td class="n" style="color:'+cor+';font-weight:700">'+pcttxt+'</td><td class="n">'+brl(r.custo)+'</td></tr>';
+if(custExp[idx]&&r.temRec){
+r.insumos.forEach(function(i){
+var ic=i.pct==null?'var(--mut)':(i.pct>15?'var(--rup)':i.pct>5?'#B7791F':i.pct<-5?'#2A6FB0':'var(--ok)');
+var ipct=i.pct==null?'s/ receita':(i.pct>0?'+':'')+fmt(i.pct,1)+'%';
+html+='<tr style="background:var(--bg)"><td style="padding-left:24px;font-size:12px">'+i.nome+'</td>'+
+'<td class="n" style="font-size:12px">'+fmt(i.real,1)+'</td><td class="n" style="font-size:12px">'+(i.temTeo?fmt(i.teo,1):'—')+'</td>'+
+'<td class="n" style="font-size:12px;color:'+ic+'">'+(i.temTeo?(i.dif>0?'+':'')+fmt(i.dif,1):'—')+'</td>'+
+'<td class="n" style="font-size:12px;color:'+ic+';font-weight:600">'+ipct+'</td><td class="n" style="font-size:12px">'+brl(i.custo)+'</td></tr>';});}});
+document.getElementById('tCust').innerHTML=html||'<tr><td colspan="6" class="muted" style="padding:14px">Nenhuma receita neste filtro.</td></tr>';
+document.getElementById('cCust').innerHTML='Clique numa receita para ver os insumos · <b style="color:var(--rup)">+% real&gt;teórico</b>=consumiu mais (desperdício) · <b style="color:#2A6FB0">−% real&lt;teórico</b>=consumiu menos · <b>s/ receita</b>=produto sem ficha técnica cadastrada';}
+
+try{rCockpit();rGeral();rCmp();rEst();rPlano();rConf();rPolpa();rMeta();rVisao();rDemGraf();rDem();rCust();initPV();}catch(e){
 document.body.insertAdjacentHTML('afterbegin','<pre style="color:#C0392B;padding:12px">Erro: '+e+'</pre>');}
 </script></body></html>"""
 
@@ -1727,11 +2066,12 @@ def construir(cli):
     """Lê as planilhas via cliente gspread e devolve o HTML do painel (ou None)."""
     pl_e = cli.open_by_key(ID_ESTOQUE)
     parsers = {"abc": parse_abc, "altos": parse_altos, "valor": parse_valor, "peso": parse_peso}
-    tabs = {t: parsers[t](fetch_aba(pl_e, nome)) for t, nome in TAB_NAMES.items()}
+    # VendasPeso removida do fluxo: não lemos mais a aba 'peso'. Densidade fixa (GRUPO_DENS).
+    tabs = {t: parsers[t](fetch_aba(pl_e, nome))
+            for t, nome in TAB_NAMES.items() if t != "peso"}
     master = build_master(tabs)
-    peso_raw = tabs.get("peso", {})
-    peso_un = {r: e["peso"] / e["qtd"] for r, e in peso_raw.items()
-               if e.get("qtd") and e.get("peso")}
+    peso_raw = {}
+    peso_un = {}                       # sem peso medido → densidade padrão por categoria
     vend = ler_vendas(pl_e)
     if vend is None:
         return None
@@ -1768,11 +2108,23 @@ def construir(cli):
     _dem = {x["ref"]: x["dem"] for x in estoque}
     _fsz = {x["ref"]: x["fsz"] for x in estoque}
     litros_map, _densmed = modelo_litros(master, peso_un)
+    try:
+        reproc = ler_reprocesso(pl_e, master)
+    except Exception as _e:
+        print(f"[aviso] reprocesso falhou: {_e}")
+        reproc = []
+    try:
+        custos = analise_real_vs_teorico(pl_e, master, rec_por_aba)
+    except Exception as _e:
+        import traceback as _tb
+        print(f"[aviso] análise de custos falhou: {_e}")
+        _tb.print_exc()
+        custos = None
     pv = (comparar_prod_venda(dfp, info, master, mensal, _dem, _fsz, _frac,
                               _hoje.strftime("%Y-%m"), litros_map)
           if (dfp is not None and len(dfp)) else None)
     return montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
-                  amanha, cap_usada, diario, pv, pesoval, litros_map, peso_un)
+                  amanha, cap_usada, diario, pv, pesoval, litros_map, peso_un, reproc, custos)
 
 
 def main():
