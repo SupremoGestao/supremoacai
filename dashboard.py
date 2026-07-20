@@ -1,6 +1,10 @@
 """
 dashboard.py — App de gestão do Supremo Açaí (estoque + produção/MRP)
 =====================================================================
+VERSAO_ARQUIVO = "2026-07-17-B" — inclui: agrupamento de polpa na aba
+Custos + correcao do CASTANHA (achar_ref_prod_truncado). Se voce esta
+lendo isso no arquivo da sua maquina, esta e a versao NOVA. ✓
+=====================================================================
 Gera 'dashboard_supremo.html': aplicação web OFFLINE, com abas e filtros
 interativos. Sem Chart.js/CDN (gráficos em SVG, JS puro embutido).
 
@@ -19,6 +23,7 @@ import os
 import re
 import sys
 import json
+from collections import defaultdict
 import math
 import calendar
 import datetime as _dt
@@ -88,7 +93,7 @@ OVERRIDE_REC = {1358: "SUPREMO", 1459: "SUPREMO", 1305: "SUPREMO",
 STOP = {"DE", "DA", "DO", "DOS", "DAS", "COM", "E", "C", "A", "O",
         "CX", "CAIXA", "SACHE", "EM", "POLPA"}
 SIZE_TOK = re.compile(r"^\d+(?:[.,]\d+)?(LTS|LT|L|ML|KG|G)?$")
-ESCOPOS = ["https://www.googleapis.com/auth/spreadsheets.readonly",
+ESCOPOS = ["https://www.googleapis.com/auth/spreadsheets",
            "https://www.googleapis.com/auth/drive.readonly"]
 C_DEEP, C_ACAI, C_BERRY, C_POLPA = "#2C1640", "#4A2270", "#9B3FD1", "#7B2FC9"
 C_FALTA = "#C0392B"
@@ -824,6 +829,40 @@ def casar_ref_nome(nome, master):
     return melhor if best >= 0.5 else None
 
 
+_STOP_LEVE = {"DE", "DA", "DO", "DOS", "DAS", "COM", "E", "C", "A", "O", "EM"}
+
+
+def _tokens_leve(s):
+    return [t for t in _norm(s).split() if t not in _STOP_LEVE and len(t) >= 2]
+
+
+def achar_ref_prod_truncado(nome, master):
+    """Casa um nome de produto TRUNCADO (sem o tamanho — cortado na exportação
+    da aba 'Produção com insumos') com a ref do cadastro completo, para poder
+    aplicar LITROS_UN_OVERRIDE quando tamanho() não acha nada no nome.
+    Diferente de casar_ref_nome (usado no Reprocesso): aqui CAIXA/POTE/SACHÊ/
+    POLPA IMPORTAM como sinal — são o que diferencia as variantes do mesmo
+    produto base (ex.: "...CAIXA" vs "...POTE" do mesmo creme)."""
+    pt = set(_tokens_leve(nome))
+    if not pt:
+        return None
+    melhor, best = None, 0.0
+    for ref, m in master.items():
+        prod = m.get("prod", "")
+        if "INSUMO" in _norm(prod):
+            continue
+        pc = set(_tokens_leve(prod))
+        if not pc:
+            continue
+        inter = pt & pc
+        if len(inter) < 2:
+            continue
+        score = len(inter) / len(pc)
+        if score > best:
+            best, melhor = score, ref
+    return melhor if best >= 0.55 else None
+
+
 def ler_consumo_real(pl):
     """Lê a aba 'Produção com insumos' e retorna CADA produção como um registro
     individual: {mes, produto, qtd, insumos:[{ref,nome,qtd,custoUn}]}.
@@ -880,19 +919,31 @@ def analise_real_vs_teorico(pl, master, rec_por_aba):
     """Análise MENSAL de desperdício: para cada mês, cruza consumo REAL de insumo
     (aba Produção com insumos) com o TEÓRICO (receita × produção realizada).
     Dois níveis: resumo por RECEITA (qual produto desperdiça) e detalhe por INSUMO.
-    Divergência = real − teórico; >5% sinaliza perda ou receita desatualizada."""
+    Divergência = real − teórico; >5% sinaliza perda ou receita desatualizada.
+
+    O casamento produto→receita é restrito à ABA certa (Açaí/Cremes/Gelatos),
+    igual à ficha técnica: um "CREME DE PISTACHE" só pode casar com a receita
+    de PISTACHE cadastrada na aba Cremes, nunca com a do Gelatos — evita
+    ambiguidade quando duas abas têm receitas com o mesmo nome."""
     prods = ler_consumo_real(pl)
     if not prods:
         return None
-    todas_recs = [r for recs in rec_por_aba.values() for r in recs]
-    _rec_cache = {}                 # nome_produto → receita casada (casa 1x por produto)
+    # categoria do produto (mix/cremes/gelatos) → aba de receitas correspondente
+    CAT_PARA_ABA = {"mix": "Açai", "cremes": "Cremes", "gelatos": "Gelatos"}
+    todas_recs = [r for recs in rec_por_aba.values() for r in recs]   # fallback
+    _rec_cache = {}                  # nome_produto → receita casada (casa 1x por produto)
 
     def teorico_da_producao(nome, qtd):
         """Insumo esperado (ref→kg) para produzir 'qtd' unidades de 'nome'."""
         if nome in _rec_cache:
             rec = _rec_cache[nome]
         else:
-            rec = casar_receita(nome, todas_recs)
+            g = _cat_vol(nome)
+            aba = CAT_PARA_ABA.get(g)
+            pool = rec_por_aba.get(aba) if aba and rec_por_aba.get(aba) else todas_recs
+            rec = casar_receita(nome, pool)
+            if not rec and pool is not todas_recs:      # não achou na aba certa → tenta geral
+                rec = casar_receita(nome, todas_recs)
             _rec_cache[nome] = rec
         if not rec:
             return None, None
@@ -903,13 +954,36 @@ def analise_real_vs_teorico(pl, master, rec_por_aba):
         g = _cat_vol(nome)
         kgun = (val if uni == "KG" else (val * GRUPO_DENS.get(g, 0.8) if uni == "L" and val else 0))
         if not kgun:
+            # nome sem tamanho (truncado na exportação) — tenta o override manual,
+            # igual já fazemos do lado da venda (litros_map). Sem isso, produção
+            # real desses itens conta no "real" mas nunca no "teórico" — inflando
+            # artificialmente a divergência da receita inteira (bug real: CASTANHA).
+            ref_prod = achar_ref_prod_truncado(nome, master)
+            over = LITROS_UN_OVERRIDE.get(ref_prod) if ref_prod else None
+            if over:
+                kgun = over * GRUPO_DENS.get(g, 0.8)
+        if not kgun:
             return None, rec["titulo"]
         bat = (qtd * kgun) / kgpb
         esp = {ing["ref"]: bat * ing["q1b"] for ing in rec["ings"] if ing["temRef"]}
         return esp, rec["titulo"]
 
     # agrega por mês → receita → insumo
-    meses = {}     # mes → {receitas:{titulo:{real,teo,custo,prod,ins:{ref:{nome,real,teo,custo}}}}}
+    # "Comparável" = insumo presente na ficha técnica (tem teórico). Embalagens e
+    # itens fora da ficha entram no CUSTO mas ficam fora do % de divergência —
+    # senão caixas/rótulos (unidades) inflam o "real" e o % vira ruído.
+    #
+    # POLPA é tratada como GRUPO (não por ref): na prática, a fábrica substitui
+    # marcas de polpa entre si (Equinócio, Mata, Tuc 14%, North Pole...) conforme
+    # disponibilidade — comparar ref-a-ref gera divergências falsas de -80%/+400%
+    # que somem quando o TOTAL de polpa é comparado. O detalhe por marca continua
+    # disponível (rastreabilidade), só a % de divergência passa a ser do grupo.
+    POLPA_GRUPO_REFS = POLPAS_AQUI_REFS | POLPAS_LOCKFRIO_REFS
+
+    def eh_polpa(ref, nome):
+        return ref in POLPA_GRUPO_REFS or "POLPA" in (nome or "").upper()
+
+    meses = {}
     for p in prods:
         mes = p["mes"]
         if not mes:
@@ -917,54 +991,296 @@ def analise_real_vs_teorico(pl, master, rec_por_aba):
         esp, titulo = teorico_da_producao(p["produto"], p["qtd"])
         titulo = titulo or p["produto"]
         M = meses.setdefault(mes, {"receitas": {}, "custoTot": 0.0})
-        R = M["receitas"].setdefault(titulo, {"real": 0.0, "teo": 0.0, "custo": 0.0,
-                                              "prodUn": 0.0, "temRec": esp is not None,
-                                              "ins": {}})
+        R = M["receitas"].setdefault(titulo, {"custo": 0.0, "prodUn": 0.0, "temRec": False,
+                                              "ins": {}, "polpaGrupo": {"real": 0.0, "teo": 0.0,
+                                              "custo": 0.0, "detalhe": {}}})
         R["prodUn"] += p["qtd"]
+        if esp is not None:
+            R["temRec"] = True
+        # agrega lançamentos por ref DENTRO da produção (mesmo insumo pode vir
+        # em 2+ lotes — sem isso o teórico duplicaria)
+        reais = {}
         for it in p["insumos"]:
-            ref, kg, cu = it["ref"], it["qtd"], it["custoUn"]
-            custo = kg * cu
-            R["real"] += kg
-            R["custo"] += custo
+            e = reais.setdefault(it["ref"], {"nome": it["nome"], "kg": 0.0, "custo": 0.0})
+            e["kg"] += it["qtd"]
+            e["custo"] += it["qtd"] * it["custoUn"]
+        # percorre a UNIÃO real ∪ ficha: insumo lançado sem ficha, e insumo da
+        # ficha nunca lançado (teórico acumula em TODAS as produções — bugfix)
+        for ref in set(reais) | set(esp or {}):
+            rl = reais.get(ref)
+            kg = rl["kg"] if rl else 0.0
+            custo = rl["custo"] if rl else 0.0
+            teo = (esp or {}).get(ref, 0.0)
+            nome = rl["nome"] if rl else master.get(ref, {}).get("prod", f"ref {ref}")
             M["custoTot"] += custo
-            teo = (esp or {}).get(ref, 0)
-            R["teo"] += teo
-            d = R["ins"].setdefault(ref, {"nome": it["nome"], "real": 0.0, "teo": 0.0, "custo": 0.0})
-            d["real"] += kg
-            d["custo"] += custo
-            d["teo"] += teo
-        # insumos esperados que nem apareceram no real (faltou lançar)
-        for ref, teo in (esp or {}).items():
-            if ref not in R["ins"]:
-                R["ins"][ref] = {"nome": master.get(ref, {}).get("prod", f"ref {ref}"),
-                                 "real": 0.0, "teo": teo, "custo": 0.0}
-                R["teo"] += teo
+            R["custo"] += custo
+            if eh_polpa(ref, nome):
+                GP = R["polpaGrupo"]
+                GP["real"] += kg
+                GP["teo"] += teo
+                GP["custo"] += custo
+                dd = GP["detalhe"].setdefault(ref, {"nome": nome, "real": 0.0, "custo": 0.0})
+                dd["real"] += kg
+                dd["custo"] += custo
+            else:
+                d = R["ins"].setdefault(ref, {"nome": nome, "real": 0.0, "teo": 0.0, "custo": 0.0})
+                d["real"] += kg
+                d["custo"] += custo
+                d["teo"] += teo
 
     # serializa para o payload
     out_meses = {}
     for mes, M in meses.items():
         receitas = []
+        perda_mes = 0.0
         for titulo, R in M["receitas"].items():
-            dif = R["real"] - R["teo"]
-            pct = (dif / R["teo"] * 100) if R["teo"] > 0 else None
-            insumos = []
+            insumos, perda_rs, realCmp, teoCmp, custoOutros = [], 0.0, 0.0, 0.0, 0.0
             for ref, d in R["ins"].items():
                 idif = d["real"] - d["teo"]
                 ipct = (idif / d["teo"] * 100) if d["teo"] > 0 else None
+                cmed = (d["custo"] / d["real"]) if d["real"] > 0 else 0.0
+                iperda = (max(0.0, idif) * cmed) if d["teo"] > 0 else 0.0
+                perda_rs += iperda
+                if d["teo"] > 0:
+                    realCmp += d["real"]; teoCmp += d["teo"]
+                else:
+                    custoOutros += d["custo"]
                 insumos.append({"ref": ref, "nome": d["nome"], "real": round(d["real"], 1),
                                 "teo": round(d["teo"], 1), "dif": round(idif, 1),
                                 "pct": round(ipct, 1) if ipct is not None else None,
-                                "custo": round(d["custo"], 2), "temTeo": d["teo"] > 0})
-            insumos.sort(key=lambda x: -abs(x["dif"]))
-            receitas.append({"receita": titulo, "real": round(R["real"], 1),
-                             "teo": round(R["teo"], 1), "dif": round(dif, 1),
+                                "custo": round(d["custo"], 2), "temTeo": d["teo"] > 0,
+                                "perda": round(iperda, 2), "isGrupo": False})
+            # grupo POLPA — uma linha só, com detalhe por marca para rastreabilidade
+            GP = R["polpaGrupo"]
+            if GP["real"] > 0 or GP["teo"] > 0:
+                gdif = GP["real"] - GP["teo"]
+                gpct = (gdif / GP["teo"] * 100) if GP["teo"] > 0 else None
+                gcmed = (GP["custo"] / GP["real"]) if GP["real"] > 0 else 0.0
+                gperda = (max(0.0, gdif) * gcmed) if GP["teo"] > 0 else 0.0
+                perda_rs += gperda
+                if GP["teo"] > 0:
+                    realCmp += GP["real"]; teoCmp += GP["teo"]
+                else:
+                    custoOutros += GP["custo"]
+                sub = sorted(({"ref": r, "nome": dd["nome"], "real": round(dd["real"], 1),
+                              "custo": round(dd["custo"], 2)}
+                             for r, dd in GP["detalhe"].items()), key=lambda x: -x["real"])
+                insumos.append({"ref": "GRUPO_POLPA", "nome": "🫐 Polpa de Açaí (grupo — marcas variam)",
+                                "real": round(GP["real"], 1), "teo": round(GP["teo"], 1),
+                                "dif": round(gdif, 1),
+                                "pct": round(gpct, 1) if gpct is not None else None,
+                                "custo": round(GP["custo"], 2), "temTeo": GP["teo"] > 0,
+                                "perda": round(gperda, 2), "isGrupo": True, "subDetalhe": sub})
+            insumos.sort(key=lambda x: -x["perda"] if x["perda"] else -abs(x["dif"]) * 0.001)
+            perda_mes += perda_rs
+            dif = realCmp - teoCmp
+            pct = (dif / teoCmp * 100) if teoCmp > 0 else None
+            receitas.append({"receita": titulo, "real": round(realCmp, 1),
+                             "teo": round(teoCmp, 1), "dif": round(dif, 1),
                              "pct": round(pct, 1) if pct is not None else None,
-                             "custo": round(R["custo"], 2), "prodUn": round(R["prodUn"]),
+                             "custo": round(R["custo"], 2),
+                             "custoOutros": round(custoOutros, 2),
+                             "perda": round(perda_rs, 2), "prodUn": round(R["prodUn"]),
                              "temRec": R["temRec"], "insumos": insumos})
-        receitas.sort(key=lambda x: -(abs(x["pct"]) if x["pct"] is not None else 0))
-        out_meses[mes] = {"receitas": receitas, "custoTot": round(M["custoTot"], 2)}
+        receitas.sort(key=lambda x: -x["perda"])
+        out_meses[mes] = {"receitas": receitas, "custoTot": round(M["custoTot"], 2),
+                          "perdaTot": round(perda_mes, 2)}
 
     return {"meses": out_meses, "mesesLista": sorted(out_meses.keys())}
+
+
+def carregar_master_leve(cli):
+    """Leitura RÁPIDA: só o cadastro (nome, estoque atual, custo) — para telas
+    que precisam listar produtos (ex.: formulário de contagem) sem rodar o
+    pipeline completo de MRP/receitas. Retorna (master, pl_e)."""
+    pl_e = cli.open_by_key(ID_ESTOQUE)
+    parsers = {"abc": parse_abc, "altos": parse_altos, "valor": parse_valor}
+    tabs = {t: parsers[t](fetch_aba(pl_e, nome)) for t, nome in TAB_NAMES.items() if t in parsers}
+    master = build_master(tabs)
+    return master, pl_e
+
+
+def itens_por_subarea(master, subarea):
+    """Lista {ref, produto, eat} dos itens de uma sub-área de Estoque, na
+    MESMA classificação usada no painel (classificacao.py). 'seco' é tudo
+    que sobra (não é câmara fria, nem polpa aqui/lockfrio, nem imobilizado)."""
+    subarea = _norm(subarea)
+    out = []
+    for ref, m in master.items():
+        eat = m.get("eat")
+        if eat is None:
+            continue
+        if subarea in ("CAMARA FRIA", "CAMARA"):
+            ok = ref in CAMARA_FRIA_REFS
+        elif subarea in ("POLPAS AQUI", "POLPAS"):
+            ok = ref in POLPAS_AQUI_REFS
+        elif subarea in ("POLPAS LOCKFRIO", "LOCKFRIO"):
+            ok = ref in POLPAS_LOCKFRIO_REFS
+        elif subarea in ("ESTOQUE SECO", "SECO"):
+            ok = (ref not in CAMARA_FRIA_REFS and ref not in POLPAS_AQUI_REFS
+                  and ref not in POLPAS_LOCKFRIO_REFS)
+        else:
+            ok = False
+        if ok:
+            out.append({"ref": ref, "produto": m.get("prod", f"ref {ref}"), "eat": eat})
+    out.sort(key=lambda x: x["produto"])
+    return out
+
+
+def salvar_contagem_inventario(pl_e, linhas):
+    """Acrescenta contagens físicas na aba 'Inventário' (cria com cabeçalho
+    se ainda não existir). 'linhas': lista de dicts {ref, produto, contado, obs}.
+    Cada chamada é um novo lote de linhas — o histórico é preservado (a
+    reconciliação usa sempre a contagem mais recente de cada item)."""
+    aba = None
+    for w in pl_e.worksheets():
+        if "INVENTARIO" in _norm(w.title):
+            aba = w
+            break
+    if not aba:
+        aba = pl_e.add_worksheet(title="Inventário", rows=2000, cols=5)
+        aba.append_row(["Referência", "Produto", "Qtd Contada", "Data Contagem", "Observação"])
+    hoje = date.today().strftime("%d/%m/%Y")
+    rows = [[l.get("ref") or "", l.get("produto", ""), l["contado"], hoje, l.get("obs", "")]
+            for l in linhas if l.get("contado") not in (None, "")]
+    if not rows:
+        return 0
+    aba.append_rows(rows, value_input_option="USER_ENTERED")
+    return len(rows)
+
+
+def salvar_reprocesso(pl_e, produto, litragem, qtd, validade):
+    """Acrescenta um item na aba 'Reprocessos' (B=produto, C=litragem,
+    D=qtd, E=validade — mesma estrutura já usada pela leitura ler_reprocesso)."""
+    aba = None
+    for w in pl_e.worksheets():
+        if "REPROCESS" in _norm(w.title):
+            aba = w
+            break
+    if not aba:
+        return False
+    aba.append_row(["", produto, f"{litragem}lt", qtd, validade], value_input_option="USER_ENTERED")
+    return True
+
+
+def ler_inventario(pl, master):
+    """Lê a aba 'Inventário' (Referência, Produto, Qtd Contada, Data, Observação).
+    Cada contagem nova é ACRESCENTADA (histórico/auditoria) — por isso, se o
+    mesmo ref aparecer mais de uma vez, mantém só a linha MAIS RECENTE (maior
+    data; empate = última na planilha) para a reconciliação atual. Cruza com
+    o ESTOQUE TEÓRICO do sistema (master['eat']) — o que o CRT diz que tem
+    HOJE, já líquido de tudo que foi lançado como saída (venda/produção)."""
+    aba = None
+    for w in pl.worksheets():
+        n = _norm(w.title)
+        if "INVENTARIO" in n:
+            aba = w.title
+            break
+    if not aba:
+        return []
+    try:
+        raw = pl.worksheet(aba).get_all_values()
+    except Exception:
+        return []
+    hi = 0
+    for i, r in enumerate(raw[:5]):
+        if any("REFERENC" in _norm(str(c)) or "PRODUTO" in _norm(str(c)) for c in r):
+            hi = i
+            break
+
+    def parse_data(s):
+        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s.strip(), fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    brutos = []
+    for ordem, r in enumerate(raw[hi + 1:]):
+        r = list(r) + [""] * 5
+        refA = _rec_num(r[0])
+        nomeInf = str(r[1]).strip()
+        contado = _rec_num(r[2])
+        dataTxt = str(r[3]).strip()
+        obs = str(r[4]).strip()
+        if not nomeInf and refA is None:
+            continue
+        if contado is None:
+            continue                      # linha sem contagem lançada ainda — ignora
+        ref = int(refA) if refA else casar_ref_nome(nomeInf, master)
+        brutos.append({"ref": ref, "nomeInformado": nomeInf, "contado": contado,
+                       "data": dataTxt, "dataObj": parse_data(dataTxt), "obs": obs,
+                       "ordem": ordem})
+
+    # dedup por ref: mantém a de maior dataObj; sem data ou empate, a última na planilha
+    ultimos = {}
+    for b in brutos:
+        chave = b["ref"] if b["ref"] is not None else ("__nome__", _norm(b["nomeInformado"]))
+        atual = ultimos.get(chave)
+        if atual is None:
+            ultimos[chave] = b
+            continue
+        d1, d2 = atual["dataObj"], b["dataObj"]
+        if (d2 or date.min) >= (d1 or date.min):     # nova é mais recente (ou empate → última vence)
+            ultimos[chave] = b
+
+    itens = []
+    for b in ultimos.values():
+        ref = b["ref"]
+        m = master.get(ref, {}) if ref else {}
+        nomeCad = m.get("prod")
+        teorico = m.get("eat")
+        custoUn = m.get("cst") or 0.0
+        contado = b["contado"]
+        difUn = (contado - teorico) if teorico is not None else None
+        difRs = (difUn * custoUn) if difUn is not None else None
+        itens.append({"ref": ref, "nomeInformado": b["nomeInformado"], "nomeCad": nomeCad,
+                      "contado": contado, "teorico": teorico, "custoUn": custoUn,
+                      "difUn": round(difUn, 2) if difUn is not None else None,
+                      "difRs": round(difRs, 2) if difRs is not None else None,
+                      "temCad": ref is not None and teorico is not None,
+                      "data": b["data"], "obs": b["obs"]})
+    return itens
+
+
+def analise_inventario(pl, master, custos):
+    """Reconcilia a contagem física (aba Inventário) com o estoque teórico do
+    sistema, e mostra AO LADO (não subtraída) a Perda de Produção já
+    conhecida daquele insumo (aba Custos) — as duas são perdas financeiras
+    DISTINTAS: uma é ineficiência de receita/processo (já rastreada), a
+    outra é o que sumiu sem nenhum lançamento (revelado só pela contagem)."""
+    itens = ler_inventario(pl, master)
+    if not itens:
+        return None
+
+    # soma a perda de produção conhecida por ref (fora do grupo polpa —
+    # dentro do grupo, a perda só existe no agregado, não por marca)
+    perda_por_ref = defaultdict(float)
+    perda_grupo_polpa = 0.0
+    if custos and custos.get("meses"):
+        for M in custos["meses"].values():
+            for R in M["receitas"]:
+                for ins in R["insumos"]:
+                    if ins.get("isGrupo"):
+                        perda_grupo_polpa += ins.get("perda", 0) or 0
+                    else:
+                        perda_por_ref[ins["ref"]] += ins.get("perda", 0) or 0
+
+    for it in itens:
+        ref = it["ref"]
+        eh_polpa = ref in (POLPAS_AQUI_REFS | POLPAS_LOCKFRIO_REFS) if ref else False
+        it["ehGrupoPolpa"] = eh_polpa
+        it["perdaProducao"] = round(perda_por_ref.get(ref, 0.0), 2) if (ref and not eh_polpa) else None
+
+    itens_cad = [i for i in itens if i["temCad"]]
+    perda_inv_total = sum(i["difRs"] for i in itens_cad if i["difRs"] and i["difRs"] < 0)
+    perda_prod_total_contados = sum(i["perdaProducao"] for i in itens_cad if i["perdaProducao"])
+    itens.sort(key=lambda x: (x["difRs"] if x["difRs"] is not None else 0))
+    return {"itens": itens, "nContados": len(itens), "nSemCadastro": len(itens) - len(itens_cad),
+            "perdaInventarioTotal": round(perda_inv_total, 2),
+            "perdaProducaoConhecida": round(perda_prod_total_contados, 2),
+            "perdaGrupoPolpa": round(perda_grupo_polpa, 2)}
 
 
 def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, frac_mes,
@@ -1094,7 +1410,7 @@ def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, fra
 # ── HTML ──────────────────────────────────────────────────────────
 def montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
            amanha, cap_usada, diario, pv=None, pesoval=None, litros_map=None, peso_un=None,
-           reproc=None, custos=None):
+           reproc=None, custos=None, inventario=None):
     from collections import Counter
     hoje = date.today().strftime("%d/%m/%Y")
     meses12 = meses_all[-12:]
@@ -1218,7 +1534,7 @@ def montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
         "resumo": {"abcVal": abc_val, "abcCnt": abc_cnt, "status": stt,
                    "acao": acao_nec, "valCat": dict(valc)},
         "cap": CAP_DIA_BATIDAS, "capUsada": cap_usada, "pv": pv, "pesoVal": pesoval or [],
-        "reproc": reproc or [], "custos": custos}
+        "reproc": reproc or [], "custos": custos, "inventario": inventario}
     dump = json.dumps(payload, ensure_ascii=False,
                       default=lambda o: o.item() if hasattr(o, "item") else str(o))
 
@@ -1341,6 +1657,7 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <button data-t="producao" onclick="showTab('producao')">Produção</button>
 <button data-t="prodvenda" onclick="showTab('prodvenda')">Produção / Venda</button>
 <button data-t="custos" onclick="showTab('custos')">Custos</button>
+<button data-t="inventario" onclick="showTab('inventario')">Inventário</button>
 <button data-t="demanda" onclick="showTab('demanda')">Demanda</button>
 </div></div>
 <div class="wrap">
@@ -1544,8 +1861,18 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <input class="busca" id="qCust" onkeyup="rCust()" placeholder="Buscar receita…"></div>
 <div class="tile"><div class="th">Real × teórico por receita <small>· clique numa receita para ver os insumos</small></div>
 <div class="tablewrap" style="max-height:600px"><table><thead><tr>
-<th>Receita / Insumo</th><th>Real (kg)</th><th>Teórico (kg)</th><th>Diferença</th><th>% div.</th><th>Custo real (R$)</th></tr></thead>
+<th>Receita / Insumo</th><th>Real (kg)</th><th>Teórico (kg)</th><th>Diferença</th><th>% div.</th><th>Perda (R$)</th><th>Custo real (R$)</th></tr></thead>
 <tbody id="tCust"></tbody></table></div><div class="cont" id="cCust"></div></div></section>
+
+<section id="inventario" class="tab"><h2 class="ttl">Inventário — Contagem Física × Sistema</h2>
+<p class="hint">Compara o <b>estoque teórico do sistema</b> (já líquido de tudo que foi lançado) com a <b>contagem física</b> lançada na aba "Inventário" da planilha. Duas perdas <b>distintas</b>, lado a lado — não se subtraem:
+<b>Perda de Inventário</b> (o que sumiu sem nenhum lançamento — furto, quebra não registrada, erro de contagem anterior) e <b>Perda de Produção conhecida</b> (já rastreada na aba Custos — ineficiência de receita/processo). Corrija cada uma na origem certa: inventário no ajuste de estoque, produção na ficha técnica.</p>
+<div class="kpis" id="invKpis" style="grid-template-columns:repeat(4,1fr)"></div>
+<div class="tile"><div class="th">Contagem × Sistema, por item <small>· ordenado pela maior perda</small></div>
+<div class="tablewrap" style="max-height:600px"><table><thead><tr>
+<th>Produto</th><th>Ref</th><th>Teórico (un)</th><th>Contado (un)</th><th>Diferença (un)</th>
+<th>Perda de Inventário (R$)</th><th>Perda de Produção conhecida (R$)</th><th>Observação</th></tr></thead>
+<tbody id="tInv"></tbody></table></div><div class="cont" id="cInv"></div></div></section>
 
 <section id="prodvenda" class="tab"><h2 class="ttl">Produção / Venda</h2><p class="hint">Produção realizada (aba Produção) × vendas, no mesmo período. Passe o mouse nos gráficos.</p>
 <div class="kpis" id="pvKpis" style="grid-template-columns:repeat(8,1fr)"></div>
@@ -2024,9 +2351,8 @@ var M=c.meses[custMes],recs=M.receitas;
 // KPIs do mês
 var comRec=recs.filter(r=>r.temRec);
 var desp=comRec.filter(r=>r.pct!=null&&r.pct>5);       // desperdício >5%
-var custoDesp=desp.reduce((s,r)=>s+Math.max(0,r.custo*(r.pct/100)/(1+r.pct/100)),0);
 var K=[['Custo real do mês','R$ '+fmt(M.custoTot,2),''],['Receitas produzidas',fmt(recs.length),''],
-['Receitas desperdiçando &gt;5%',fmt(desp.length),desp.length?'al':''],['Perda estimada (R$)','R$ '+fmt(custoDesp,0),custoDesp>0?'al':'']];
+['Receitas desperdiçando &gt;5%',fmt(desp.length),desp.length?'al':''],['Perda do mês (R$)','R$ '+fmt(M.perdaTot||0,2),(M.perdaTot||0)>0?'al':'']];
 document.getElementById('custKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
 // filtro
 var q=(document.getElementById('qCust').value||'').toLowerCase();
@@ -2042,22 +2368,56 @@ var cor=r.pct==null?'var(--mut)':(r.pct>15?'var(--rup)':r.pct>5?'#B7791F':r.pct<
 var pcttxt=r.pct==null?'<span title="receita não cadastrada">s/ receita</span>':(r.pct>0?'+':'')+fmt(r.pct,1)+'%';
 var seta=r.temRec?(custExp[idx]?'▾':'▸'):'';
 html+='<tr style="cursor:'+(r.temRec?'pointer':'default')+';background:var(--card)" onclick="toggReceita('+idx+')">'+
-'<td><b>'+seta+' '+r.receita+'</b><br><span style="font-size:10px;color:var(--mut)">'+fmt(r.prodUn)+' un produzidas</span></td>'+
+'<td><b>'+seta+' '+r.receita+'</b><br><span style="font-size:10px;color:var(--mut)">'+fmt(r.prodUn)+' un produzidas'+(r.custoOutros?' · embalagem R$ '+fmt(r.custoOutros,0):'')+'</span></td>'+
 '<td class="n">'+fmt(r.real,1)+'</td><td class="n">'+(r.temRec?fmt(r.teo,1):'—')+'</td>'+
 '<td class="n" style="color:'+cor+';font-weight:700">'+(r.temRec?(r.dif>0?'+':'')+fmt(r.dif,1):'—')+'</td>'+
-'<td class="n" style="color:'+cor+';font-weight:700">'+pcttxt+'</td><td class="n">'+brl(r.custo)+'</td></tr>';
+'<td class="n" style="color:'+cor+';font-weight:700">'+pcttxt+'</td>'+
+'<td class="n" style="color:'+(r.perda>0?'var(--rup)':'var(--mut)')+';font-weight:700">'+(r.perda>0?'R$ '+fmt(r.perda,0):'—')+'</td>'+
+'<td class="n">'+brl(r.custo)+'</td></tr>';
 if(custExp[idx]&&r.temRec){
 r.insumos.forEach(function(i){
 var ic=i.pct==null?'var(--mut)':(i.pct>15?'var(--rup)':i.pct>5?'#B7791F':i.pct<-5?'#2A6FB0':'var(--ok)');
-var ipct=i.pct==null?'s/ receita':(i.pct>0?'+':'')+fmt(i.pct,1)+'%';
-html+='<tr style="background:var(--bg)"><td style="padding-left:24px;font-size:12px">'+i.nome+'</td>'+
+var ipct=i.pct==null?'<span title="fora da ficha técnica (embalagem ou receita incompleta)">s/ ficha</span>':(i.pct>0?'+':'')+fmt(i.pct,1)+'%';
+var tituloExtra=i.isGrupo?' title="Marcas de polpa são intercambiáveis na produção — comparamos o total, não marca a marca"':'';
+html+='<tr style="background:var(--bg)"'+tituloExtra+'><td style="padding-left:24px;font-size:12px">'+i.nome+'</td>'+
 '<td class="n" style="font-size:12px">'+fmt(i.real,1)+'</td><td class="n" style="font-size:12px">'+(i.temTeo?fmt(i.teo,1):'—')+'</td>'+
 '<td class="n" style="font-size:12px;color:'+ic+'">'+(i.temTeo?(i.dif>0?'+':'')+fmt(i.dif,1):'—')+'</td>'+
-'<td class="n" style="font-size:12px;color:'+ic+';font-weight:600">'+ipct+'</td><td class="n" style="font-size:12px">'+brl(i.custo)+'</td></tr>';});}});
-document.getElementById('tCust').innerHTML=html||'<tr><td colspan="6" class="muted" style="padding:14px">Nenhuma receita neste filtro.</td></tr>';
-document.getElementById('cCust').innerHTML='Clique numa receita para ver os insumos · <b style="color:var(--rup)">+% real&gt;teórico</b>=consumiu mais (desperdício) · <b style="color:#2A6FB0">−% real&lt;teórico</b>=consumiu menos · <b>s/ receita</b>=produto sem ficha técnica cadastrada';}
+'<td class="n" style="font-size:12px;color:'+ic+';font-weight:600">'+ipct+'</td>'+
+'<td class="n" style="font-size:12px;color:'+(i.perda>0?'var(--rup)':'var(--mut)')+'">'+(i.perda>0?'R$ '+fmt(i.perda,0):'—')+'</td>'+
+'<td class="n" style="font-size:12px">'+brl(i.custo)+'</td></tr>';
+if(i.isGrupo&&i.subDetalhe&&i.subDetalhe.length){
+i.subDetalhe.forEach(function(s){
+html+='<tr style="background:var(--bg)"><td style="padding-left:44px;font-size:11px;color:var(--mut)">↳ '+s.nome+'</td>'+
+'<td class="n" style="font-size:11px;color:var(--mut)">'+fmt(s.real,1)+'</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td>'+
+'<td class="n" style="font-size:11px;color:var(--mut)">'+brl(s.custo)+'</td></tr>';});}});}});
+document.getElementById('tCust').innerHTML=html||'<tr><td colspan="7" class="muted" style="padding:14px">Nenhuma receita neste filtro.</td></tr>';
+document.getElementById('cCust').innerHTML='Clique numa receita para ver os insumos · O <b>% div.</b> compara só os ingredientes da ficha técnica (embalagens ficam no custo, fora do %) · <b>Perda R$</b> = excesso × custo do insumo · <b style="color:var(--rup)">+%</b>=desperdício · <b style="color:#2A6FB0">−%</b>=rendeu mais que a ficha · 🫐 Polpa é comparada em GRUPO (marcas variam por disponibilidade) — o ↳ mostra qual marca foi usada de fato';}
 
-try{rCockpit();rGeral();rCmp();rEst();rPlano();rConf();rPolpa();rMeta();rVisao();rDemGraf();rDem();rCust();initPV();}catch(e){
+// Inventário
+function rInv(){var v=D.inventario;
+if(!v||!v.itens||!v.itens.length){document.getElementById('invKpis').innerHTML='<div class="kpi"><div class="l">Sem contagem lançada</div><div class="v">—</div></div>';
+document.getElementById('tInv').innerHTML='<tr><td colspan="8" class="muted" style="padding:14px">Lance a contagem na aba "Inventário" da planilha (Referência, Produto, Qtd Contada, Data, Observação).</td></tr>';return;}
+var K=[['Perda de Inventário','R$ '+fmt(Math.abs(v.perdaInventarioTotal),0),v.perdaInventarioTotal<0?'al':''],
+['Perda de Produção (itens contados)','R$ '+fmt(v.perdaProducaoConhecida,0),v.perdaProducaoConhecida>0?'al':''],
+['Itens contados',fmt(v.nContados),''],
+['Sem cadastro no sistema',fmt(v.nSemCadastro),v.nSemCadastro?'al':'']];
+document.getElementById('invKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
+document.getElementById('tInv').innerHTML=v.itens.map(function(i){
+var corDif=i.difRs==null?'var(--mut)':(i.difRs<-1?'var(--rup)':i.difRs>1?'#2A6FB0':'var(--ok)');
+var nome=i.nomeCad||i.nomeInformado||'—';
+var semCad=!i.temCad?' <span style="font-size:10px;color:var(--rup)" title="não achou cadastro correspondente">⚠ s/ cadastro</span>':'';
+var polpaTag=i.ehGrupoPolpa?' <span style="font-size:10px;color:var(--mut)" title="polpa é rastreada em grupo — perda de produção não é atribuível por marca individual">🫐 grupo</span>':'';
+return '<tr><td>'+nome+semCad+polpaTag+'</td><td class="n">'+(i.ref||'—')+'</td>'+
+'<td class="n">'+(i.teorico!=null?fmt(i.teorico,1):'—')+'</td><td class="n">'+fmt(i.contado,1)+'</td>'+
+'<td class="n" style="color:'+corDif+';font-weight:700">'+(i.difUn!=null?(i.difUn>0?'+':'')+fmt(i.difUn,1):'—')+'</td>'+
+'<td class="n" style="color:'+corDif+';font-weight:700">'+(i.difRs!=null?brl(i.difRs):'—')+'</td>'+
+'<td class="n" style="color:'+(i.perdaProducao>0?'var(--rup)':'var(--mut)')+'">'+(i.perdaProducao!=null?(i.perdaProducao>0?brl(i.perdaProducao):'—'):'—')+'</td>'+
+'<td style="font-size:12px;color:var(--mut)">'+(i.obs||'')+' '+(i.data?'· '+i.data:'')+'</td></tr>';}).join('');
+document.getElementById('cInv').innerHTML='<b style="color:var(--rup)">Perda de Inventário</b> = contado abaixo do teórico do sistema — não explicada por nenhum lançamento (investigar: furto, quebra, erro de contagem) · '+
+'<b style="color:var(--rup)">Perda de Produção conhecida</b> = já rastreada na aba Custos (insumo lançado a mais que a ficha) — corrigir na FICHA/processo, não no ajuste de estoque · '+
+'as duas <b>somam</b>, não se cancelam';}
+
+try{rCockpit();rGeral();rCmp();rEst();rPlano();rConf();rPolpa();rMeta();rVisao();rDemGraf();rDem();rCust();rInv();initPV();}catch(e){
 document.body.insertAdjacentHTML('afterbegin','<pre style="color:#C0392B;padding:12px">Erro: '+e+'</pre>');}
 </script></body></html>"""
 
@@ -2120,11 +2480,17 @@ def construir(cli):
         print(f"[aviso] análise de custos falhou: {_e}")
         _tb.print_exc()
         custos = None
+    try:
+        inventario = analise_inventario(pl_e, master, custos)
+    except Exception as _e:
+        print(f"[aviso] análise de inventário falhou: {_e}")
+        inventario = None
     pv = (comparar_prod_venda(dfp, info, master, mensal, _dem, _fsz, _frac,
                               _hoje.strftime("%Y-%m"), litros_map)
           if (dfp is not None and len(dfp)) else None)
     return montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
-                  amanha, cap_usada, diario, pv, pesoval, litros_map, peso_un, reproc, custos)
+                  amanha, cap_usada, diario, pv, pesoval, litros_map, peso_un, reproc, custos,
+                  inventario)
 
 
 def main():
