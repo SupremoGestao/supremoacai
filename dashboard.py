@@ -915,178 +915,95 @@ def ler_consumo_real(pl):
     return prods
 
 
-def analise_real_vs_teorico(pl, master, rec_por_aba):
-    """Análise MENSAL de desperdício: para cada mês, cruza consumo REAL de insumo
-    (aba Produção com insumos) com o TEÓRICO (receita × produção realizada).
-    Dois níveis: resumo por RECEITA (qual produto desperdiça) e detalhe por INSUMO.
-    Divergência = real − teórico; >5% sinaliza perda ou receita desatualizada.
+def analise_produto_mensal(pl, master, rec_por_aba, mensal):
+    """Comparativo MENSAL por PRODUTO específico (não por receita genérica):
+    custo real do produto mês a mês, consumo real × teórico da ficha técnica
+    que ele usa, e vendas REAIS (aba Vendas) — para ver se o produto está
+    ganhando ou perdendo força de venda, mês atual × mês anterior.
 
     O casamento produto→receita é restrito à ABA certa (Açaí/Cremes/Gelatos),
     igual à ficha técnica: um "CREME DE PISTACHE" só pode casar com a receita
-    de PISTACHE cadastrada na aba Cremes, nunca com a do Gelatos — evita
-    ambiguidade quando duas abas têm receitas com o mesmo nome."""
+    de PISTACHE cadastrada na aba Cremes, nunca com a do Gelatos."""
     prods = ler_consumo_real(pl)
     if not prods:
         return None
-    # categoria do produto (mix/cremes/gelatos) → aba de receitas correspondente
     CAT_PARA_ABA = {"mix": "Açai", "cremes": "Cremes", "gelatos": "Gelatos"}
-    todas_recs = [r for recs in rec_por_aba.values() for r in recs]   # fallback
-    _rec_cache = {}                  # nome_produto → receita casada (casa 1x por produto)
+    todas_recs = [r for recs in rec_por_aba.values() for r in recs]
+    _rec_cache = {}
 
-    def teorico_da_producao(nome, qtd):
-        """Insumo esperado (ref→kg) para produzir 'qtd' unidades de 'nome'."""
+    def receita_de(nome):
         if nome in _rec_cache:
-            rec = _rec_cache[nome]
-        else:
-            g = _cat_vol(nome)
-            aba = CAT_PARA_ABA.get(g)
-            pool = rec_por_aba.get(aba) if aba and rec_por_aba.get(aba) else todas_recs
-            rec = casar_receita(nome, pool)
-            if not rec and pool is not todas_recs:      # não achou na aba certa → tenta geral
-                rec = casar_receita(nome, todas_recs)
-            _rec_cache[nome] = rec
-        if not rec:
-            return None, None
-        kgpb = sum(i["q1b"] for i in rec["ings"])
-        if kgpb <= 0:
-            return None, rec["titulo"]
-        val, uni = tamanho(nome)
+            return _rec_cache[nome]
         g = _cat_vol(nome)
-        kgun = (val if uni == "KG" else (val * GRUPO_DENS.get(g, 0.8) if uni == "L" and val else 0))
-        if not kgun:
-            # nome sem tamanho (truncado na exportação) — tenta o override manual,
-            # igual já fazemos do lado da venda (litros_map). Sem isso, produção
-            # real desses itens conta no "real" mas nunca no "teórico" — inflando
-            # artificialmente a divergência da receita inteira (bug real: CASTANHA).
-            ref_prod = achar_ref_prod_truncado(nome, master)
-            over = LITROS_UN_OVERRIDE.get(ref_prod) if ref_prod else None
-            if over:
-                kgun = over * GRUPO_DENS.get(g, 0.8)
-        if not kgun:
-            return None, rec["titulo"]
-        bat = (qtd * kgun) / kgpb
-        esp = {ing["ref"]: bat * ing["q1b"] for ing in rec["ings"] if ing["temRef"]}
-        return esp, rec["titulo"]
+        aba = CAT_PARA_ABA.get(g)
+        pool = rec_por_aba.get(aba) if aba and rec_por_aba.get(aba) else todas_recs
+        rec = casar_receita(nome, pool)
+        if not rec and pool is not todas_recs:
+            rec = casar_receita(nome, todas_recs)
+        _rec_cache[nome] = rec
+        return rec
 
-    # agrega por mês → receita → insumo
-    # "Comparável" = insumo presente na ficha técnica (tem teórico). Embalagens e
-    # itens fora da ficha entram no CUSTO mas ficam fora do % de divergência —
-    # senão caixas/rótulos (unidades) inflam o "real" e o % vira ruído.
-    #
-    # POLPA é tratada como GRUPO (não por ref): na prática, a fábrica substitui
-    # marcas de polpa entre si (Equinócio, Mata, Tuc 14%, North Pole...) conforme
-    # disponibilidade — comparar ref-a-ref gera divergências falsas de -80%/+400%
-    # que somem quando o TOTAL de polpa é comparado. O detalhe por marca continua
-    # disponível (rastreabilidade), só a % de divergência passa a ser do grupo.
-    POLPA_GRUPO_REFS = POLPAS_AQUI_REFS | POLPAS_LOCKFRIO_REFS
+    # nome normalizado → ref (cadastro completo), para cruzar com vendas reais
+    nome2ref = {}
+    for ref, m in master.items():
+        nome2ref.setdefault(_norm(m.get("prod", "")), ref)
 
-    def eh_polpa(ref, nome):
-        return ref in POLPA_GRUPO_REFS or "POLPA" in (nome or "").upper()
+    _ref_cache = {}
 
-    meses = {}
+    def ref_do_produto(nome):
+        if nome in _ref_cache:
+            return _ref_cache[nome]
+        k = _norm(nome)
+        ref = nome2ref.get(k) or achar_ref_prod_truncado(nome, master) or casar_ref_nome(nome, master)
+        _ref_cache[nome] = ref
+        return ref
+
+    dados = {}   # produto → {mes → {qtd, custo, realKg, teoKg}}
     for p in prods:
-        mes = p["mes"]
+        nome, mes, qtd = p["produto"], p["mes"], p["qtd"]
         if not mes:
             continue
-        esp, titulo = teorico_da_producao(p["produto"], p["qtd"])
-        titulo = titulo or p["produto"]
-        M = meses.setdefault(mes, {"receitas": {}, "custoTot": 0.0})
-        R = M["receitas"].setdefault(titulo, {"custo": 0.0, "prodUn": 0.0, "temRec": False,
-                                              "ins": {}, "polpaGrupo": {"real": 0.0, "teo": 0.0,
-                                              "custo": 0.0, "detalhe": {}}})
-        R["prodUn"] += p["qtd"]
-        if esp is not None:
-            R["temRec"] = True
-        # agrega lançamentos por ref DENTRO da produção (mesmo insumo pode vir
-        # em 2+ lotes — sem isso o teórico duplicaria)
-        reais = {}
+        D = dados.setdefault(nome, {})
+        M = D.setdefault(mes, {"qtd": 0.0, "custo": 0.0, "realKg": 0.0, "teoKg": 0.0})
+        M["qtd"] += qtd
         for it in p["insumos"]:
-            e = reais.setdefault(it["ref"], {"nome": it["nome"], "kg": 0.0, "custo": 0.0})
-            e["kg"] += it["qtd"]
-            e["custo"] += it["qtd"] * it["custoUn"]
-        # percorre a UNIÃO real ∪ ficha: insumo lançado sem ficha, e insumo da
-        # ficha nunca lançado (teórico acumula em TODAS as produções — bugfix)
-        for ref in set(reais) | set(esp or {}):
-            rl = reais.get(ref)
-            kg = rl["kg"] if rl else 0.0
-            custo = rl["custo"] if rl else 0.0
-            teo = (esp or {}).get(ref, 0.0)
-            nome = rl["nome"] if rl else master.get(ref, {}).get("prod", f"ref {ref}")
-            M["custoTot"] += custo
-            R["custo"] += custo
-            if eh_polpa(ref, nome):
-                GP = R["polpaGrupo"]
-                GP["real"] += kg
-                GP["teo"] += teo
-                GP["custo"] += custo
-                dd = GP["detalhe"].setdefault(ref, {"nome": nome, "real": 0.0, "custo": 0.0})
-                dd["real"] += kg
-                dd["custo"] += custo
-            else:
-                d = R["ins"].setdefault(ref, {"nome": nome, "real": 0.0, "teo": 0.0, "custo": 0.0})
-                d["real"] += kg
-                d["custo"] += custo
-                d["teo"] += teo
+            M["custo"] += it["qtd"] * it["custoUn"]
+            M["realKg"] += it["qtd"]
+        rec = receita_de(nome)
+        if rec:
+            kgpb = sum(i["q1b"] for i in rec["ings"])
+            val, uni = tamanho(nome)
+            g = _cat_vol(nome)
+            kgun = (val if uni == "KG" else (val * GRUPO_DENS.get(g, 0.8) if uni == "L" and val else 0))
+            if not kgun:
+                ref_o = achar_ref_prod_truncado(nome, master)
+                over = LITROS_UN_OVERRIDE.get(ref_o) if ref_o else None
+                if over:
+                    kgun = over * GRUPO_DENS.get(g, 0.8)
+            if kgun and kgpb > 0:
+                bat = (qtd * kgun) / kgpb
+                M["teoKg"] += bat * kgpb
 
-    # serializa para o payload
-    out_meses = {}
-    for mes, M in meses.items():
-        receitas = []
-        perda_mes = 0.0
-        for titulo, R in M["receitas"].items():
-            insumos, perda_rs, realCmp, teoCmp, custoOutros = [], 0.0, 0.0, 0.0, 0.0
-            for ref, d in R["ins"].items():
-                idif = d["real"] - d["teo"]
-                ipct = (idif / d["teo"] * 100) if d["teo"] > 0 else None
-                cmed = (d["custo"] / d["real"]) if d["real"] > 0 else 0.0
-                iperda = (max(0.0, idif) * cmed) if d["teo"] > 0 else 0.0
-                perda_rs += iperda
-                if d["teo"] > 0:
-                    realCmp += d["real"]; teoCmp += d["teo"]
-                else:
-                    custoOutros += d["custo"]
-                insumos.append({"ref": ref, "nome": d["nome"], "real": round(d["real"], 1),
-                                "teo": round(d["teo"], 1), "dif": round(idif, 1),
-                                "pct": round(ipct, 1) if ipct is not None else None,
-                                "custo": round(d["custo"], 2), "temTeo": d["teo"] > 0,
-                                "perda": round(iperda, 2), "isGrupo": False})
-            # grupo POLPA — uma linha só, com detalhe por marca para rastreabilidade
-            GP = R["polpaGrupo"]
-            if GP["real"] > 0 or GP["teo"] > 0:
-                gdif = GP["real"] - GP["teo"]
-                gpct = (gdif / GP["teo"] * 100) if GP["teo"] > 0 else None
-                gcmed = (GP["custo"] / GP["real"]) if GP["real"] > 0 else 0.0
-                gperda = (max(0.0, gdif) * gcmed) if GP["teo"] > 0 else 0.0
-                perda_rs += gperda
-                if GP["teo"] > 0:
-                    realCmp += GP["real"]; teoCmp += GP["teo"]
-                else:
-                    custoOutros += GP["custo"]
-                sub = sorted(({"ref": r, "nome": dd["nome"], "real": round(dd["real"], 1),
-                              "custo": round(dd["custo"], 2)}
-                             for r, dd in GP["detalhe"].items()), key=lambda x: -x["real"])
-                insumos.append({"ref": "GRUPO_POLPA", "nome": "🫐 Polpa de Açaí (grupo — marcas variam)",
-                                "real": round(GP["real"], 1), "teo": round(GP["teo"], 1),
-                                "dif": round(gdif, 1),
-                                "pct": round(gpct, 1) if gpct is not None else None,
-                                "custo": round(GP["custo"], 2), "temTeo": GP["teo"] > 0,
-                                "perda": round(gperda, 2), "isGrupo": True, "subDetalhe": sub})
-            insumos.sort(key=lambda x: -x["perda"] if x["perda"] else -abs(x["dif"]) * 0.001)
-            perda_mes += perda_rs
-            dif = realCmp - teoCmp
-            pct = (dif / teoCmp * 100) if teoCmp > 0 else None
-            receitas.append({"receita": titulo, "real": round(realCmp, 1),
-                             "teo": round(teoCmp, 1), "dif": round(dif, 1),
-                             "pct": round(pct, 1) if pct is not None else None,
-                             "custo": round(R["custo"], 2),
-                             "custoOutros": round(custoOutros, 2),
-                             "perda": round(perda_rs, 2), "prodUn": round(R["prodUn"]),
-                             "temRec": R["temRec"], "insumos": insumos})
-        receitas.sort(key=lambda x: -x["perda"])
-        out_meses[mes] = {"receitas": receitas, "custoTot": round(M["custoTot"], 2),
-                          "perdaTot": round(perda_mes, 2)}
-
-    return {"meses": out_meses, "mesesLista": sorted(out_meses.keys())}
+    produtos_out = []
+    for nome, meses_d in dados.items():
+        rec = receita_de(nome)
+        ref = ref_do_produto(nome)
+        meses_lista = sorted(meses_d.keys())
+        serie = []
+        for mes in meses_lista:
+            M = meses_d[mes]
+            vend = round(mensal.get((ref, mes), 0)) if ref else 0
+            dif = M["realKg"] - M["teoKg"]
+            pct = (dif / M["teoKg"] * 100) if M["teoKg"] > 0 else None
+            serie.append({"mes": mes, "qtd": round(M["qtd"]), "custo": round(M["custo"], 2),
+                         "vendas": vend, "realKg": round(M["realKg"], 1),
+                         "teoKg": round(M["teoKg"], 1),
+                         "pct": round(pct, 1) if pct is not None else None})
+        produtos_out.append({"produto": nome, "ref": ref if ref else None,
+                            "receita": rec["titulo"] if rec else None, "serie": serie})
+    produtos_out.sort(key=lambda x: -sum(s["custo"] for s in x["serie"]))
+    meses_all = sorted({s["mes"] for p in produtos_out for s in p["serie"]})
+    return {"produtos": produtos_out, "meses": meses_all}
 
 
 def carregar_master_leve(cli):
@@ -1244,43 +1161,19 @@ def ler_inventario(pl, master):
     return itens
 
 
-def analise_inventario(pl, master, custos):
+def analise_inventario(pl, master):
     """Reconcilia a contagem física (aba Inventário) com o estoque teórico do
-    sistema, e mostra AO LADO (não subtraída) a Perda de Produção já
-    conhecida daquele insumo (aba Custos) — as duas são perdas financeiras
-    DISTINTAS: uma é ineficiência de receita/processo (já rastreada), a
-    outra é o que sumiu sem nenhum lançamento (revelado só pela contagem)."""
+    sistema — o que sumiu sem nenhum lançamento (furto, quebra não
+    registrada, erro de contagem anterior). O desperdício de produção não
+    entra mais aqui: é lançado direto no processo de produção, não estimado."""
     itens = ler_inventario(pl, master)
     if not itens:
         return None
-
-    # soma a perda de produção conhecida por ref (fora do grupo polpa —
-    # dentro do grupo, a perda só existe no agregado, não por marca)
-    perda_por_ref = defaultdict(float)
-    perda_grupo_polpa = 0.0
-    if custos and custos.get("meses"):
-        for M in custos["meses"].values():
-            for R in M["receitas"]:
-                for ins in R["insumos"]:
-                    if ins.get("isGrupo"):
-                        perda_grupo_polpa += ins.get("perda", 0) or 0
-                    else:
-                        perda_por_ref[ins["ref"]] += ins.get("perda", 0) or 0
-
-    for it in itens:
-        ref = it["ref"]
-        eh_polpa = ref in (POLPAS_AQUI_REFS | POLPAS_LOCKFRIO_REFS) if ref else False
-        it["ehGrupoPolpa"] = eh_polpa
-        it["perdaProducao"] = round(perda_por_ref.get(ref, 0.0), 2) if (ref and not eh_polpa) else None
-
     itens_cad = [i for i in itens if i["temCad"]]
     perda_inv_total = sum(i["difRs"] for i in itens_cad if i["difRs"] and i["difRs"] < 0)
-    perda_prod_total_contados = sum(i["perdaProducao"] for i in itens_cad if i["perdaProducao"])
     itens.sort(key=lambda x: (x["difRs"] if x["difRs"] is not None else 0))
     return {"itens": itens, "nContados": len(itens), "nSemCadastro": len(itens) - len(itens_cad),
-            "perdaInventarioTotal": round(perda_inv_total, 2),
-            "perdaProducaoConhecida": round(perda_prod_total_contados, 2),
-            "perdaGrupoPolpa": round(perda_grupo_polpa, 2)}
+            "perdaInventarioTotal": round(perda_inv_total, 2)}
 
 
 def comparar_prod_venda(dfp, info, master, mensal, dem_por_ref, fsz_por_ref, frac_mes,
@@ -1464,19 +1357,50 @@ def montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
     batidas = round(sum(p["batidas"] for p in plano))
     polpa_total = round(sum(x["kg"] for x in insumos if x["polpa"]))
 
-    kpis = [("Valor em estoque", "R$ " + nf(valor_op, 2), ""),
-            ("Estoque parado", "R$ " + nf(parado, 2), "al" if parado else ""),
-            ("Volume parado (un)", nf(parado_qtd), ""),
-            ("Valor polpas", "R$ " + nf(polpa_valor, 2), ""),
-            ("Polpas vendidas / mês", nf(polpa_vend_mes), ""),
-            ("Cobertura polpas (dias)", (nf(polpa_dias) if polpa_dias is not None else "—"),
-             "al" if (polpa_dias is not None and polpa_dias < 60) else ""),
-            ("Comprar (itens)", nf(n_comprar), "al" if n_comprar else ""),
-            ("Ruptura", nf(n_rup), "al" if n_rup else ""),
-            ("Batidas / mês", nf(batidas), ""),
-            ("Imobilizado", "R$ " + nf(valor_imob, 2), "")]
-    kpi_html = "".join(f'<div class="kpi {c}"><div class="l">{esc(l)}</div>'
-                       f'<div class="v">{v}</div></div>' for l, v, c in kpis)
+    # fração do mês atual já decorrida — usada para projetar o total do mês
+    frac_mes = hoje_dt.day / calendar.monthrange(hoje_dt.year, hoje_dt.month)[1]
+
+    # Custo real: mês atual (até hoje) / acumulado do ano / previsão do mês inteiro
+    custo_mes_atual = custo_ano = custo_previsto = None
+    if custos and custos.get("mesesLista"):
+        ult = custos["mesesLista"][-1]
+        custo_mes_atual = custos["meses"][ult].get("custoTot", 0)
+        custo_ano = sum(v.get("custoTot", 0) for m, v in custos["meses"].items() if m.startswith(ano_now))
+        if ult == mes_atual_ym and frac_mes > 0:
+            custo_previsto = custo_mes_atual / frac_mes
+
+    # Vendas de polpa: mês atual (até hoje) / acumulado do ano / previsão do mês inteiro
+    refs_polpa = {x["ref"] for x in polpa_itens}
+    polpa_vend_mes_atual = round(sum(mensal.get((r, mes_atual_ym), 0) for r in refs_polpa))
+    polpa_vend_ano = round(sum(mensal.get((r, m), 0) for r in refs_polpa for m in meses12 if m.startswith(ano_now)))
+    polpa_vend_previsto = round(polpa_vend_mes_atual / frac_mes) if frac_mes > 0 else polpa_vend_mes_atual
+
+    def _kpi(l, v, c=""):
+        return f'<div class="kpi {c}"><div class="l">{esc(l)}</div><div class="v">{v}</div></div>'
+
+    kpis_compras = [("Comprar (itens)", nf(n_comprar), "al" if n_comprar else ""),
+                    ("Ruptura", nf(n_rup), "al" if n_rup else ""),
+                    ("Cobertura polpas (dias)", (nf(polpa_dias) if polpa_dias is not None else "—"),
+                     "al" if (polpa_dias is not None and polpa_dias < 60) else ""),
+                    ("Vendas polpa (mês)", nf(polpa_vend_mes_atual), ""),
+                    ("Vendas polpa (ano)", nf(polpa_vend_ano), ""),
+                    ("Previsão polpa (fim do mês)", nf(polpa_vend_previsto), "")]
+    kpis_estoque = [("Valor em estoque", "R$ " + nf(valor_op, 2), ""),
+                    ("Estoque parado", "R$ " + nf(parado, 2), "al" if parado else ""),
+                    ("Volume parado (un)", nf(parado_qtd), ""),
+                    ("Valor polpas", "R$ " + nf(polpa_valor, 2), ""),
+                    ("Imobilizado", "R$ " + nf(valor_imob, 2), "")]
+    kpis_producao = [("Batidas / mês", nf(batidas), ""),
+                     ("Produzir (itens)", nf(n_prod), "al" if n_prod else ""),
+                     ("Capacidade/dia", nf(cap_usada) + " / " + nf(CAP_DIA_BATIDAS), "")]
+    kpis_custos = [("Custo real (mês)", "R$ " + nf(custo_mes_atual, 2) if custo_mes_atual is not None else "—", ""),
+                   ("Custo real (ano)", "R$ " + nf(custo_ano, 2) if custo_ano is not None else "—", ""),
+                   ("Previsão (fim do mês)", "R$ " + nf(custo_previsto, 2) if custo_previsto is not None else "—", "")]
+
+    kpi_html_compras = "".join(_kpi(*k) for k in kpis_compras)
+    kpi_html_estoque = "".join(_kpi(*k) for k in kpis_estoque)
+    kpi_html_producao = "".join(_kpi(*k) for k in kpis_producao)
+    kpi_html_custos = "".join(_kpi(*k) for k in kpis_custos)
 
     abc_val = {c: round(sum(x["valor"] for x in estoque if x["abc"] == c)) for c in "ABC"}
     abc_cnt = {c: sum(1 for x in estoque if x["abc"] == c) for c in "ABC"}
@@ -1539,7 +1463,9 @@ def montar(estoque, plano, insumos, cat, info, master, mensal, meses_all,
                       default=lambda o: o.item() if hasattr(o, "item") else str(o))
 
     return (_PAGE.replace("__DATA_JSON__", dump).replace("__DATA__", hoje)
-            .replace("__KPIS__", kpi_html).replace("__ALERTAS__", al_html)
+            .replace("__KPIS_COMPRAS__", kpi_html_compras).replace("__KPIS_ESTOQUE__", kpi_html_estoque)
+            .replace("__KPIS_PRODUCAO__", kpi_html_producao).replace("__KPIS_CUSTOS__", kpi_html_custos)
+            .replace("__ALERTAS__", al_html)
             .replace("__INSGRAF__", ins_svg).replace("__POLPAGRAF__", polpa_grp)
             .replace("__VOLINFO__", esc(volinfo))
             .replace("__LTOT__", nf(litros_tot_mes)).replace("__LACAI__", nf(lac))
@@ -1555,6 +1481,12 @@ _PAGE = r"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8">
 --deep:#2C1640;--acai:#5B2A86;--berry:#9B3FD1;--lil:#C88DE8;--teal:#1FA3A0;--amber:#E0912F;
 --ok:#2E9E6B;--rup:#D9434E;--repor:#E0912F;--sg:#8A5A9E;--sm:#9A93A6;--ina:#BEB6C8;
 --sh:0 1px 2px rgba(20,10,40,.05),0 3px 12px rgba(20,10,40,.06)}
+[data-theme="dark"]{--bg:#161020;--card:#211935;--ink:#EEE9F7;--mut:#9C93B5;--line:#372C50;--grid:#2A2140;
+--deep:#0F0A19;--acai:#8354BE;--berry:#B96CEF;--lil:#D9AEF2;--teal:#3FCAC6;--amber:#F0A94C;
+--ok:#4FCB8E;--rup:#F26670;--repor:#F0A94C;--sg:#AB80C4;--sm:#B7AFD1;--ina:#4C3F6C;
+--sh:0 1px 2px rgba(0,0,0,.35),0 3px 14px rgba(0,0,0,.4)}
+[data-theme="dark"] #confCamTile,[data-theme="dark"] #confAquiTile,[data-theme="dark"] #confLfTile,
+[data-theme="dark"] #confSecoTile,[data-theme="dark"] #confRepTile{background:var(--card)!important}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;font-size:14px}
 .wrap{max-width:1280px;margin:0 auto;padding:0 22px}
 .topbar{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20;box-shadow:0 1px 6px rgba(20,10,40,.04)}
@@ -1647,24 +1579,102 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 .tip .tt{font-weight:800;margin-bottom:4px;color:var(--deep)}
 .tip div{display:flex;align-items:center;gap:6px;padding:1px 0}.tip i{width:9px;height:9px;border-radius:2px}.tip b{margin-left:auto}
 @media(max-width:920px){.kpis{grid-template-columns:repeat(2,1fr)}.grid2,.grid4,.cards{grid-template-columns:1fr 1fr}}
+.kpi-block{margin:16px 0 6px}
+.kpi-block-h{font-size:12.5px;font-weight:800;color:var(--mut);text-transform:uppercase;letter-spacing:.03em;margin-bottom:7px}
+.kpi-block-click{cursor:pointer;border-radius:12px;padding:8px;margin:16px -8px 6px;transition:.12s}
+.kpi-block-click:hover{background:rgba(123,47,201,.06)}
+.kpi.kpi-click{cursor:pointer;transition:.12s;border:2px solid transparent}
+.kpi.kpi-click:hover{background:var(--grid)}
+.kpi.kpi-click.kpi-on{border-color:var(--berry);background:var(--grid)}
+.kpi-block-go{font-size:10.5px;font-weight:700;color:var(--berry);text-transform:none;letter-spacing:0;opacity:0;transition:.12s;margin-left:6px}
+.kpi-block-click:hover .kpi-block-go{opacity:1}
+@media(max-width:920px){.kpi-block .kpis{grid-template-columns:repeat(2,1fr)!important}.kpi-block-go{opacity:1}}
+
+/* ── Menu lateral (sidebar) ─────────────────────────────────────────── */
+.applayout{display:flex;align-items:stretch;min-height:100vh}
+.sidebar{width:216px;flex:0 0 auto;background:var(--deep);color:#fff;position:sticky;top:0;
+  height:100vh;overflow-y:auto;overflow-x:hidden;transition:width .16s ease;z-index:30}
+.sidebar.collapsed{width:58px}
+.sb-head{display:flex;align-items:center;gap:10px;padding:14px 12px;border-bottom:1px solid rgba(255,255,255,.12)}
+.sidebar.collapsed .sb-head{flex-direction:column;gap:8px;padding:12px 8px}
+.sidebar.collapsed .sb-head #btnTema{margin-left:0!important}
+.sb-toggle{background:rgba(255,255,255,.1);border:0;color:#fff;width:32px;height:32px;border-radius:8px;
+  cursor:pointer;font-size:15px;flex:0 0 auto;transition:.12s}
+.sb-toggle:hover{background:rgba(255,255,255,.22)}
+.sb-brand{font-weight:800;font-size:14px;white-space:nowrap;overflow:hidden}
+.sidebar.collapsed .sb-brand{display:none}
+.sidenav{padding:8px 0}
+.snav-item,.snav-group-head{display:flex;align-items:center;gap:11px;width:100%;background:none;border:0;
+  color:rgba(255,255,255,.88);padding:10px 16px;font-size:13.3px;font-weight:600;cursor:pointer;
+  text-align:left;font-family:inherit;white-space:nowrap;transition:.1s}
+.snav-item:hover,.snav-group-head:hover{background:rgba(255,255,255,.08)}
+.snav-item.on{background:var(--berry);color:#fff}
+.snav-group.active>.snav-group-head{background:rgba(255,255,255,.14);color:#fff}
+.snav-ico{flex:0 0 18px;text-align:center;font-size:14.5px}
+.snav-lbl{overflow:hidden;text-overflow:ellipsis}
+.sidebar.collapsed .snav-lbl,.sidebar.collapsed .snav-car{display:none}
+.sidebar.collapsed .snav-sub{display:none!important}
+.snav-car{margin-left:auto;font-size:10px;transition:transform .12s;flex:0 0 auto}
+.snav-sub{display:none;padding-left:6px;background:rgba(0,0,0,.14)}
+.snav-group.open .snav-sub{display:block}
+.snav-group.open .snav-car{transform:rotate(0deg)}
+.snav-sub button{display:flex;align-items:center;gap:9px;width:100%;background:none;border:0;
+  color:rgba(255,255,255,.72);padding:8px 16px 8px 34px;font-size:12.6px;cursor:pointer;text-align:left;
+  font-family:inherit;white-space:nowrap}
+.snav-sub button:hover{background:rgba(255,255,255,.08);color:#fff}
+.mainarea{flex:1;min-width:0}
+.sb-backdrop{display:none;position:fixed;inset:0;background:rgba(20,10,40,.45);z-index:25}
+@media(max-width:760px){
+  .sidebar{position:fixed;left:0;top:0;height:100vh;width:230px;transform:translateX(-100%);transition:transform .18s ease}
+  .sidebar.mobopen{transform:translateX(0)}
+  .sidebar.collapsed{width:230px}
+  .sidebar.collapsed .snav-lbl,.sidebar.collapsed .snav-car,.sidebar.collapsed .sb-brand{display:block}
+  .sidebar.collapsed .snav-sub{display:none}
+  .sidebar.collapsed.mobopen .snav-sub{display:block}
+  .sb-backdrop.show{display:block}
+}
 </style></head><body>
+<div class="applayout">
+<div class="sidebar" id="sidebar">
+<div class="sb-head"><button class="sb-toggle" onclick="toggleSidebar()">☰</button><span class="sb-brand">Supremo Açaí</span><button class="sb-toggle" id="btnTema" onclick="toggleTema()" style="margin-left:auto" title="Alternar modo escuro">🌙</button></div>
+<nav class="sidenav">
+<button class="snav-item on" data-t="geral" onclick="showTab('geral')"><span class="snav-ico">📊</span><span class="snav-lbl">Visão Geral</span></button>
+<button class="snav-item" data-t="compras" onclick="showTab('compras')"><span class="snav-ico">🛒</span><span class="snav-lbl">Compras</span></button>
+<div class="snav-group" id="grp-estoque">
+<button class="snav-group-head" onclick="toggleGroup(this)"><span class="snav-ico">📦</span><span class="snav-lbl">Estoque</span><span class="snav-car">▾</span></button>
+<div class="snav-sub">
+<button onclick="showTab('estoque');showSubById('visao')">Visão Geral</button>
+<button onclick="showTab('estoque');showSubById('camara')">Câmara Fria</button>
+<button onclick="showTab('estoque');showSubById('polpas')">Polpas</button>
+<button onclick="showTab('estoque');showSubById('seco')">Estoque Seco</button>
+<button onclick="showTab('estoque');showSubById('demandaest')">Demanda Estoque</button>
+<button onclick="showTab('estoque');showSubById('reproc')">Reprocesso</button>
+</div></div>
+<div class="snav-group" id="grp-producao">
+<button class="snav-group-head" onclick="toggleGroup(this)"><span class="snav-ico">🏭</span><span class="snav-lbl">Produção</span><span class="snav-car">▾</span></button>
+<div class="snav-sub">
+<button onclick="showTab('producao')">Plano de Produção</button>
+<button onclick="showTab('prodvenda')">Produção × Venda</button>
+<button onclick="showTab('demanda')">Demanda</button>
+</div></div>
+<button class="snav-item" data-t="inventario" onclick="showTab('inventario')"><span class="snav-ico">📋</span><span class="snav-lbl">Inventário</span></button>
+<button class="snav-item" data-t="custos" onclick="showTab('custos')"><span class="snav-ico">💰</span><span class="snav-lbl">Custos</span></button>
+<button class="snav-item" data-t="kpimeta" onclick="showTab('kpimeta')"><span class="snav-ico">🎯</span><span class="snav-lbl">KPI - Meta</span></button>
+</nav>
+</div>
+<div class="sb-backdrop" id="sbBackdrop" onclick="toggleSidebar()"></div>
+<div class="mainarea">
 <div class="topbar"><div class="wrap"><div class="brand"><span class="logo">S</span>Supremo Açaí · Painel</div>
 <div class="upd">Atualizado em __DATA__ · __NPROD__ itens · __NPLANO__ em produção</div></div></div>
-<div class="pages"><div class="wrap">
-<button class="on" data-t="geral" onclick="showTab('geral')">Visão Geral</button>
-<button data-t="compras" onclick="showTab('compras')">Compras</button>
-<button data-t="estoque" onclick="showTab('estoque')">Estoque</button>
-<button data-t="producao" onclick="showTab('producao')">Produção</button>
-<button data-t="prodvenda" onclick="showTab('prodvenda')">Produção / Venda</button>
-<button data-t="custos" onclick="showTab('custos')">Custos</button>
-<button data-t="inventario" onclick="showTab('inventario')">Inventário</button>
-<button data-t="demanda" onclick="showTab('demanda')">Demanda</button>
-</div></div>
 <div class="wrap">
 
-<section id="geral" class="tab on"><h2 class="ttl">Visão Geral</h2><p class="hint">O que fazer hoje — clique num cartão para ir direto à ação. Abaixo, os indicadores e gráficos (clique nas fatias para filtrar).</p>
+
+<section id="geral" class="tab on"><h2 class="ttl">Visão Geral</h2><p class="hint">O que fazer hoje — clique num cartão para ir direto à ação. Abaixo, os indicadores por área e gráficos (clique nas fatias para filtrar).</p>
 <div class="cockpit" id="cockpit"></div>
-<div class="kpis">__KPIS__</div>
+<div class="kpi-block kpi-block-click" onclick="showTab('compras')"><div class="kpi-block-h">🛒 Compras <span class="kpi-block-go">ver aba →</span></div><div class="kpis" style="grid-template-columns:repeat(3,1fr)">__KPIS_COMPRAS__</div></div>
+<div class="kpi-block kpi-block-click" onclick="showTab('estoque')"><div class="kpi-block-h">📦 Estoque <span class="kpi-block-go">ver aba →</span></div><div class="kpis" style="grid-template-columns:repeat(5,1fr)">__KPIS_ESTOQUE__</div></div>
+<div class="kpi-block kpi-block-click" onclick="showTab('producao')"><div class="kpi-block-h">🏭 Produção <span class="kpi-block-go">ver aba →</span></div><div class="kpis" style="grid-template-columns:repeat(3,1fr)">__KPIS_PRODUCAO__</div></div>
+<div class="kpi-block kpi-block-click" onclick="showTab('custos')"><div class="kpi-block-h">💰 Custos <span class="kpi-block-go">ver aba →</span><small style="text-transform:none;font-weight:600"> · consumo real de insumo, sem estimativa de desperdício</small></div><div class="kpis" style="grid-template-columns:repeat(3,1fr)">__KPIS_CUSTOS__</div></div>
 <div class="grid4">
 <div class="tile"><div class="th">Valor por curva ABC <small>· faturamento 12m</small></div><div id="pizAbc"></div></div>
 <div class="tile"><div class="th">Situação dos itens</div><div id="pizStatus"></div></div>
@@ -1703,12 +1713,16 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <span class="chip" data-s="camara" onclick="showSub('camara',this)">❄️ Câmara Fria</span>
 <span class="chip" data-s="polpas" onclick="showSub('polpas',this)">🫐 Polpas</span>
 <span class="chip" data-s="seco" onclick="showSub('seco',this)">📦 Estoque Seco</span>
+<span class="chip" data-s="demandaest" onclick="showSub('demandaest',this)">📈 Demanda Estoque</span>
 <span class="chip" data-s="reproc" onclick="showSub('reproc',this)">♻️ Reprocesso</span>
 <span class="chip" data-s="todos" onclick="showSub('todos',this)">Ver todos</span>
 </div>
 
 <div class="sub" id="sub-visao">
 <div class="kpis" id="visKpis" style="grid-template-columns:repeat(5,1fr)"></div>
+<div class="grid2">
+<div class="tile"><div class="th">Polpa consumida por mês <small>· principal insumo, visão geral</small></div><div id="polpaLine"></div></div>
+<div class="tile"><div class="th">Necessidade de polpa vs estoque</div>__POLPAGRAF__</div></div>
 <div class="grid2">
 <div class="tile"><div class="th">Valor por sub-área</div><div id="pizSubEst"></div></div>
 <div class="tile"><div class="th">🔥 Top 10 abaixo do mínimo <small>· qualquer sub-área</small></div>
@@ -1738,8 +1752,6 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 
 <div class="sub" id="sub-polpas" style="display:none">
 <div class="kpis" id="polpaKpis" style="grid-template-columns:repeat(4,1fr)"></div>
-<div class="grid2"><div class="tile"><div class="th">Polpa consumida por mês</div><div id="polpaLine"></div></div>
-<div class="tile"><div class="th">Necessidade vs estoque</div>__POLPAGRAF__</div></div>
 <div class="tile printarea" id="confAquiTile" style="border-left:5px solid var(--polpa);background:linear-gradient(90deg,#F9F3FE,var(--card) 30%)">
 <div class="th" style="display:flex;justify-content:space-between;align-items:center">📋 Conferência física — Polpas (aqui) <small style="font-weight:600;color:var(--mut)"><b id="confDia">—</b></small></div>
 <p class="hint" style="margin-top:0">Polpas guardadas na fábrica. Salva localmente.</p>
@@ -1790,6 +1802,17 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <div class="tablewrap" style="max-height:440px"><table><thead><tr>
 <th>Ref</th><th>Produto</th><th>Grupo ERP</th><th>Estoque</th><th>Consumo</th><th>Valor</th><th>Cob.</th><th>Status</th></tr></thead>
 <tbody id="tSeco"></tbody></table></div><div class="cont" id="cSeco"></div></div></div>
+
+<div class="sub" id="sub-demandaest" style="display:none">
+<div class="kpis" id="demEstKpis" style="grid-template-columns:repeat(4,1fr)"></div>
+<p class="hint" style="margin-top:0">Visão preventiva: mostra <b>todos</b> os itens com demanda, ordenados pela menor cobertura (o que vai acabar primeiro) — antes de virarem ruptura na aba Compras.</p>
+<div class="slic"><input class="busca" id="qDemEst" onkeyup="rDemandaEst()" placeholder="Buscar item ou referência…"></div>
+<div class="tile"><div class="tablewrap" style="max-height:500px"><table><thead><tr>
+<th onclick="sortT('demEst','ref')">Ref</th><th onclick="sortT('demEst','produto')">Item</th>
+<th onclick="sortT('demEst','dem')">Demanda/mês</th><th onclick="sortT('demEst','eat')">Estoque</th>
+<th onclick="sortT('demEst','cob')">Cobertura (meses)</th><th onclick="sortT('demEst','comprar')">Sugestão de compra</th>
+<th onclick="sortT('demEst','status')">Status</th></tr></thead><tbody id="tDemEst"></tbody></table></div>
+<div class="cont" id="cDemEst"></div></div></div>
 
 <div class="sub" id="sub-reproc" style="display:none">
 <div class="kpis" id="repKpis" style="grid-template-columns:repeat(4,1fr)"></div>
@@ -1848,30 +1871,30 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}
 <div class="tile"><div class="th">Produção por base <small>· produtos que usam a mesma receita/base — produza a base junto</small></div>
 <div class="tablewrap" style="max-height:300px"><table><thead><tr>
 <th>Base (receita)</th><th>Lote mín</th><th>Batidas totais</th><th>Produtos</th></tr></thead>
-<tbody id="tBases"></tbody></table></div></div></section>
+<tbody id="tBases"></tbody></table></div></div>
+<div class="tile"><div class="th">🔍 Buscar produto <small>· média de produção e venda por mês, histórico real</small></div>
+<div class="slic"><input class="busca" id="qProdBusca" onkeyup="rProdBusca()" placeholder="Digite o nome ou referência do produto…"></div>
+<div id="prodBuscaResult"><p class="hint" style="margin:8px 0 0">Digite ao menos 2 letras do nome, ou a referência.</p></div></div>
+</section>
 
 
-<section id="custos" class="tab"><h2 class="ttl">Custos & Desperdício por Receita</h2><p class="hint">Consumo <b>real</b> de insumo (aba "Produção com insumos") vs <b>teórico</b> (ficha técnica × produção) por <b>mês</b>. Divergência acima de 5% = possível desperdício ou receita desatualizada.</p>
+<section id="custos" class="tab"><h2 class="ttl">Custos — Comparativo Mensal por Produto</h2><p class="hint">Custo real e vendas de cada produto, <b>mês atual × mês anterior</b> — veja se o produto está ganhando ou perdendo força de venda, e se o consumo de insumo bate com a ficha técnica (informativo).</p>
 <div class="slic" id="custMeses" style="margin-bottom:8px"></div>
-<div class="kpis" id="custKpis" style="grid-template-columns:repeat(4,1fr)"></div>
-<div class="slic"><span class="lbl">Mostrar</span>
-<span class="chip on" data-v="" onclick="setCust('',this)">Todas as receitas</span>
-<span class="chip" data-v="desp" onclick="setCust('desp',this)">Só desperdício (&gt;5%)</span>
-<span class="chip" data-v="semrec" onclick="setCust('semrec',this)">Sem ficha técnica</span>
-<input class="busca" id="qCust" onkeyup="rCust()" placeholder="Buscar receita…"></div>
-<div class="tile"><div class="th">Real × teórico por receita <small>· clique numa receita para ver os insumos</small></div>
+<div class="kpis" id="custKpis" style="grid-template-columns:repeat(5,1fr)"></div>
+<div class="slic"><input class="busca" id="qCust" onkeyup="rCust()" placeholder="Buscar produto ou referência…"></div>
+<div class="tile"><div class="th">Produto × mês selecionado × mês anterior <small>· ordenado pelo maior custo do mês</small></div>
 <div class="tablewrap" style="max-height:600px"><table><thead><tr>
-<th>Receita / Insumo</th><th>Real (kg)</th><th>Teórico (kg)</th><th>Diferença</th><th>% div.</th><th>Perda (R$)</th><th>Custo real (R$)</th></tr></thead>
+<th>Produto</th><th>Custo (mês)</th><th>Custo (mês ant.)</th><th>Δ Custo</th>
+<th>Vendas (mês)</th><th>Vendas (mês ant.)</th><th>Δ Vendas</th><th>Consumo vs Ficha</th></tr></thead>
 <tbody id="tCust"></tbody></table></div><div class="cont" id="cCust"></div></div></section>
 
 <section id="inventario" class="tab"><h2 class="ttl">Inventário — Contagem Física × Sistema</h2>
-<p class="hint">Compara o <b>estoque teórico do sistema</b> (já líquido de tudo que foi lançado) com a <b>contagem física</b> lançada na aba "Inventário" da planilha. Duas perdas <b>distintas</b>, lado a lado — não se subtraem:
-<b>Perda de Inventário</b> (o que sumiu sem nenhum lançamento — furto, quebra não registrada, erro de contagem anterior) e <b>Perda de Produção conhecida</b> (já rastreada na aba Custos — ineficiência de receita/processo). Corrija cada uma na origem certa: inventário no ajuste de estoque, produção na ficha técnica.</p>
-<div class="kpis" id="invKpis" style="grid-template-columns:repeat(4,1fr)"></div>
-<div class="tile"><div class="th">Contagem × Sistema, por item <small>· ordenado pela maior perda</small></div>
+<p class="hint">Compara o <b>estoque teórico do sistema</b> (já líquido de tudo que foi lançado) com a <b>contagem física</b> lançada na aba "Inventário" da planilha — a diferença é o que sumiu sem nenhum lançamento (furto, quebra não registrada, erro de contagem anterior).</p>
+<div class="kpis" id="invKpis" style="grid-template-columns:repeat(3,1fr)"></div>
+<div class="tile"><div class="th">Contagem × Sistema, por item <small>· ordenado pela maior diferença</small></div>
 <div class="tablewrap" style="max-height:600px"><table><thead><tr>
 <th>Produto</th><th>Ref</th><th>Teórico (un)</th><th>Contado (un)</th><th>Diferença (un)</th>
-<th>Perda de Inventário (R$)</th><th>Perda de Produção conhecida (R$)</th><th>Observação</th></tr></thead>
+<th>Diferença (R$)</th><th>Observação</th></tr></thead>
 <tbody id="tInv"></tbody></table></div><div class="cont" id="cInv"></div></div></section>
 
 <section id="prodvenda" class="tab"><h2 class="ttl">Produção / Venda</h2><p class="hint">Produção realizada (aba Produção) × vendas, no mesmo período. Passe o mouse nos gráficos.</p>
@@ -1905,8 +1928,12 @@ O painel converte peso em litros usando densidades fixas, validadas com a opera�
 </div></div>
 </section>
 
+<section id="kpimeta" class="tab"><h2 class="ttl">KPI — Meta</h2><p class="hint">Metas da operação e a comprovação real de cada uma, por categoria.</p>
+<div class="kpi-block-h" style="margin-top:4px">📦 KPI Produção</div>
+<div class="tile" style="border-left:5px solid var(--acai)"><div class="th">🎯 Litragem — 55.000 L/mês <small>· dividida pela proporção real da produção · dias úteis (feriados de Fortaleza descontados)</small></div><div id="metaBox"></div></div>
+</section>
+
 <section id="demanda" class="tab"><h2 class="ttl">Demanda</h2><p class="hint">Clique nos cartões para filtrar. Passe o mouse nos gráficos para ver o valor de cada período. <b>__VOLINFO__</b></p>
-<div class="tile" style="border-left:5px solid var(--acai)"><div class="th">🎯 Meta de PRODUÇÃO — 55.000 L/mês <small>· dividida pela proporção real da produção · 5 dias úteis (feriados de Fortaleza descontados)</small></div><div id="metaBox"></div></div>
 <div class="cards">
 <div class="dcard on" data-v="" onclick="setCat('dem','',this)"><div class="l">Média mensal 2026</div><div class="v">__LTOT__ <span class="u">L / mês</span></div></div>
 <div class="dcard" data-v="mix" onclick="setCat('dem','mix',this)"><div class="l">Açaí — média/mês</div><div class="v">__LACAI__ <span class="u">L</span></div></div>
@@ -1923,16 +1950,34 @@ O painel converte peso em litros usando densidades fixas, validadas com a opera�
 <th onclick="sortT('dem','fsz')">Fator sazonal</th><th onclick="sortT('dem','dias')">Dias cob.</th></tr></thead>
 <tbody id="tDem"></tbody></table></div><div class="cont" id="cDem"></div></div></section>
 </div>
+</div></div>
 <script>
 var D=__DATA_JSON__;
+String.prototype._nb=function(){return this.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();};
 var C={acai:'#5B2A86',berry:'#9B3FD1',lil:'#C88DE8',deep:'#2C1640',polpa:'#7B2FC9',
 ok:'#2E9E6B',repor:'#E0912F',rup:'#D9434E',sg:'#8A5A9E',sm:'#9A93A6',ina:'#BEB6C8',outros:'#C9B3DD'};
 function fmt(v,d){return v==null?'—':new Intl.NumberFormat('pt-BR',{minimumFractionDigits:d||0,maximumFractionDigits:d||0}).format(v);}
 function brl(v){return v==null?'—':'R$ '+fmt(v,2);}
+var GRUPO_DE_TAB={estoque:'grp-estoque',producao:'grp-producao',prodvenda:'grp-producao',demanda:'grp-producao'};
 function showTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
 document.getElementById(id).classList.add('on');
-document.querySelectorAll('.pages button').forEach(b=>b.classList.toggle('on',b.getAttribute('data-t')==id));
+document.querySelectorAll('.sidenav [data-t]').forEach(b=>b.classList.toggle('on',b.getAttribute('data-t')==id));
+document.querySelectorAll('.snav-group').forEach(g=>g.classList.remove('active'));
+var gid=GRUPO_DE_TAB[id];
+if(gid){var g=document.getElementById(gid);if(g){g.classList.add('active','open');}}
+if(window.innerWidth<=760){document.getElementById('sidebar').classList.remove('mobopen');document.getElementById('sbBackdrop').classList.remove('show');}
 window.scrollTo(0,0);}
+function toggleGroup(el){var grp=el.parentNode;grp.classList.toggle('open');}
+function toggleSidebar(){var sb=document.getElementById('sidebar');
+if(window.innerWidth<=760){var open=sb.classList.toggle('mobopen');
+document.getElementById('sbBackdrop').classList.toggle('show',open);}
+else{var col=sb.classList.toggle('collapsed');
+try{localStorage.setItem('sbCollapsed',col?'1':'0');}catch(e){}}}
+function toggleTema(){var atual=document.documentElement.getAttribute('data-theme');
+var novo=atual=='dark'?'':'dark';
+if(novo)document.documentElement.setAttribute('data-theme',novo);else document.documentElement.removeAttribute('data-theme');
+document.getElementById('btnTema').textContent=novo=='dark'?'☀️':'🌙';
+try{localStorage.setItem('tema',novo);}catch(e){}}
 function cls(a){return '<span class="cls '+a+'">'+a+'</span>';}
 function bdg(s){return '<span class="badge b-'+s.replace(/[ /]/g,'')+'">'+s+'</span>';}
 
@@ -1997,8 +2042,8 @@ function goAcao(a){showTab(a=='Comprar'?'compras':a=='Produzir'?'producao':'polp
 
 function chipSet(sc,v){var b=document.getElementById('chips-'+sc);if(!b)return;
 b.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',(c.getAttribute('data-v')||'')==v));}
-var sortState={cmp:{k:'cob',asc:true},est:{k:'',asc:true},dem:{k:'dem',asc:false}};
-function sortT(sc,k){var s=sortState[sc];if(s.k==k)s.asc=!s.asc;else{s.k=k;s.asc=true;}sc=='cmp'?rCmp():sc=='est'?rEst():rDem();}
+var sortState={cmp:{k:'cob',asc:true},est:{k:'',asc:true},dem:{k:'dem',asc:false},demEst:{k:'cob',asc:true}};
+function sortT(sc,k){var s=sortState[sc];if(s.k==k)s.asc=!s.asc;else{s.k=k;s.asc=true;}sc=='cmp'?rCmp():sc=='est'?rEst():sc=='demEst'?rDemandaEst():rDem();}
 function applySort(arr,sc){var s=sortState[sc];if(!s.k)return arr;
 return arr.slice().sort(function(a,b){var x=a[s.k],y=b[s.k];if(x==null)x=-Infinity;if(y==null)y=-Infinity;
 if(typeof x=='string'||typeof y=='string')return s.asc?(''+x).localeCompare(y):(''+y).localeCompare(x);return s.asc?x-y:y-x;});}
@@ -2009,8 +2054,8 @@ function setCat(sc,v,el){if(sc=='prod')gProd=v;else gDem=v;el.parentNode.querySe
 
 function comprasBar(ref){document.getElementById('qCmp').value=ref;rCmp();}
 function filtraCmp(){return D.estoque.filter(x=>x.acao=='Comprar'&&(x.status=='Ruptura'||x.status=='Repor')&&(!aCmp||x.abc==aCmp)&&(!oCmp||x.origem==oCmp));}
-function rCmp(){var q=(document.getElementById('qCmp').value||'').toLowerCase(),st=document.getElementById('sCmp').value;
-var base=filtraCmp().filter(x=>!st||x.status==st),r=applySort(base.filter(x=>!q||(x.produto+x.ref).toLowerCase().indexOf(q)>-1),'cmp');
+function rCmp(){var q=(document.getElementById('qCmp').value||'')._nb(),st=document.getElementById('sCmp').value;
+var base=filtraCmp().filter(x=>!st||x.status==st),r=applySort(base.filter(x=>!q||(x.produto+x.ref)._nb().indexOf(q)>-1),'cmp');
 document.getElementById('tCmp').innerHTML=r.map(x=>'<tr><td class="n">'+x.ref+'</td><td>'+x.produto+'</td><td>'+cls(x.abc)+
 '</td><td>'+(x.origem||'—')+'</td><td class="n">'+fmt(x.eat,1)+'</td><td class="n">'+fmt(x.precisa)+
 '</td><td class="n"><b>'+fmt(x.comprar)+'</b></td><td class="n">'+fmt(x.cob,1)+'</td><td>'+bdg(x.status)+'</td></tr>').join('');
@@ -2018,8 +2063,8 @@ document.getElementById('cCmp').textContent=r.length+' itens para comprar';
 var top=base.slice().sort((a,b)=>b.comprar-a.comprar).slice(0,12),mx=Math.max.apply(null,top.map(x=>x.comprar).concat([1]));
 document.getElementById('barCmp').innerHTML=top.length?top.map(x=>'<div class="cbar" onclick="comprasBar('+x.ref+')"><span class="cbl">'+x.produto+'</span><span class="cbt"><i style="width:'+Math.max(3,x.comprar/mx*100)+'%"></i></span><span class="cbv">'+fmt(x.comprar)+'</span></div>').join(''):'<p class="muted">nada a comprar</p>';}
 
-function rEst(){var q=(document.getElementById('qEst').value||'').toLowerCase(),st=document.getElementById('sEst').value,ac=document.getElementById('acEst').value;
-var r=applySort(D.estoque.filter(x=>(!aEst||x.abc==aEst)&&(!st||x.status==st)&&(!ac||x.acao==ac)&&(!q||(x.produto+x.ref).toLowerCase().indexOf(q)>-1)),'est');
+function rEst(){var q=(document.getElementById('qEst').value||'')._nb(),st=document.getElementById('sEst').value,ac=document.getElementById('acEst').value;
+var r=applySort(D.estoque.filter(x=>(!aEst||x.abc==aEst)&&(!st||x.status==st)&&(!ac||x.acao==ac)&&(!q||(x.produto+x.ref)._nb().indexOf(q)>-1)),'est');
 document.getElementById('tEst').innerHTML=r.map(x=>'<tr><td class="n">'+x.ref+'</td><td>'+x.produto+'</td><td>'+cls(x.abc)+
 '</td><td>'+bdg(x.acao)+'</td><td class="n">'+fmt(x.eat,1)+'</td><td class="n">'+fmt(x.precisa)+
 '</td><td class="n">'+(x.comprar>0?'<b>'+fmt(x.comprar)+'</b>':'—')+'</td><td class="n">'+fmt(x.cob,1)+
@@ -2072,8 +2117,8 @@ lineChart('polpaLine',D.meses,[{name:'Polpa (kg)',vals:D.polpa,color:C.polpa}],f
 
 // ============ SUB-ABAS DO ESTOQUE ============
 function showSub(s,el){el.parentNode.querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');
-['visao','camara','polpas','seco','reproc','todos'].forEach(k=>{var d=document.getElementById('sub-'+k);if(d)d.style.display=k==s?'':'none';});
-if(s=='visao')rVisao();if(s=='camara')rCam();if(s=='seco')rSeco();if(s=='reproc')rReproc();
+['visao','camara','polpas','seco','demandaest','reproc','todos'].forEach(k=>{var d=document.getElementById('sub-'+k);if(d)d.style.display=k==s?'':'none';});
+if(s=='visao')rVisao();if(s=='camara')rCam();if(s=='seco')rSeco();if(s=='demandaest')rDemandaEst();if(s=='reproc')rReproc();
 if(s=='polpas')rPolpaFull();}
 function rPolpaFull(){rPolpa();rConf();rConfLf();}
 
@@ -2095,7 +2140,8 @@ document.getElementById('pizSubEst').innerHTML=donut([
 {label:'Reprocesso',value:acc.reprocesso.v,color:'#8ba05a',act:"showSubById('reproc')"}]);
 var sub={camara:'❄️ Câmara',polpa:'🫐 Polpa',seco:'📦 Seco',reprocesso:'♻️ Reproc',imob:'Imob'};
 var top=todos.filter(x=>x.status=='Ruptura'||x.status=='Repor').sort((a,b)=>(b.dem||0)-(a.dem||0)).slice(0,10);
-document.getElementById('tRupTop').innerHTML=top.length?top.map(x=>'<tr><td class="n">'+x.ref+'</td><td>'+x.produto+'</td><td>'+(sub[x.subEst]||'—')+'</td><td class="n">'+fmt(x.eat,0)+'</td><td class="n">'+fmt(x.precisa,0)+'</td><td class="n" style="color:#C0392B;font-weight:700">'+fmt((x.precisa||0)-(x.eat||0),0)+'</td></tr>').join(''):'<tr><td colspan="6" class="muted" style="padding:14px">Nada em ruptura 🎉</td></tr>';}
+document.getElementById('tRupTop').innerHTML=top.length?top.map(x=>'<tr><td class="n">'+x.ref+'</td><td>'+x.produto+'</td><td>'+(sub[x.subEst]||'—')+'</td><td class="n">'+fmt(x.eat,0)+'</td><td class="n">'+fmt(x.precisa,0)+'</td><td class="n" style="color:#C0392B;font-weight:700">'+fmt((x.precisa||0)-(x.eat||0),0)+'</td></tr>').join(''):'<tr><td colspan="6" class="muted" style="padding:14px">Nada em ruptura 🎉</td></tr>';
+rPolpa();}
 function showSubById(s){var el=document.querySelector('#subnav-est .chip[data-s="'+s+'"]');if(el)showSub(s,el);}
 
 // Câmara fria
@@ -2108,19 +2154,39 @@ document.getElementById('tCam').innerHTML=r.length?r.map(x=>'<tr><td class="n">'
 rConfSub('cam',r,'tConfCam','camDia','camInfo',function(x){return '<td>'+cat(x.grupo)+'</td>';},'cat');}
 
 // Estoque Seco
-function rSeco(){var q=(document.getElementById('qSeco')?document.getElementById('qSeco').value:'').toLowerCase();
+function rSeco(){var q=(document.getElementById('qSeco')?document.getElementById('qSeco').value:'')._nb();
 var all=D.estoque.filter(x=>x.subEst=='seco').sort((a,b)=>(b.valor||0)-(a.valor||0));
 var vTot=0,parado=0,rup=0;all.forEach(x=>{vTot+=x.valor||0;if((x.status=='Sem giro'||x.status=='Sem movimento')&&x.eat>0)parado+=x.valor||0;if(x.status=='Ruptura'||x.status=='Repor')rup++;});
 var K=[['Valor em estoque','R$ '+fmt(vTot,2),''],['Itens',fmt(all.length),''],['Parado (R$)','R$ '+fmt(parado,2),parado?'al':''],['Abaixo do mínimo',fmt(rup),rup?'al':'']];
 document.getElementById('secoKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
-var r=q?all.filter(x=>(x.produto+x.ref).toLowerCase().indexOf(q)>-1):all;
+var r=q?all.filter(x=>(x.produto+x.ref)._nb().indexOf(q)>-1):all;
 document.getElementById('tSeco').innerHTML=r.length?r.map(x=>'<tr><td class="n">'+x.ref+'</td><td>'+x.produto+'</td><td style="font-size:11px;color:var(--mut)">'+(x.grupo||'—').slice(0,26)+'</td><td class="n">'+fmt(x.eat,0)+'</td><td class="n">'+fmt(x.consumo,0)+'</td><td class="n">'+brl(x.valor)+'</td><td class="n">'+fmt(x.cob,1)+'</td><td>'+bdg(x.status)+'</td></tr>').join(''):'<tr><td colspan="8" class="muted" style="padding:14px">—</td></tr>';
 document.getElementById('cSeco').textContent=r.length+' de '+all.length+' itens';
 rConfSeco();}
-function rConfSeco(){var q=(document.getElementById('qConfSeco').value||'').toLowerCase();
+function rConfSeco(){var q=(document.getElementById('qConfSeco').value||'')._nb();
 var all=D.estoque.filter(x=>x.subEst=='seco').sort((a,b)=>(b.valor||0)-(a.valor||0));
-var r=q?all.filter(x=>(x.produto+x.ref).toLowerCase().indexOf(q)>-1):all.slice(0,80);
+var r=q?all.filter(x=>(x.produto+x.ref)._nb().indexOf(q)>-1):all.slice(0,80);
 rConfSub('seco',r,'tConfSeco','secoDia','secoInfo',function(x){return '';},'');}
+
+// Demanda Estoque — visao preventiva por cobertura (antes de virar ruptura)
+function rDemandaEst(){var q=(document.getElementById('qDemEst').value||'')._nb();
+var todos=D.estoque.filter(x=>!x.imob&&x.dem>0);
+var urgente30=todos.filter(x=>x.cob!=null&&x.cob*30<30).length;
+var urgente60=todos.filter(x=>x.cob!=null&&x.cob*30<60).length;
+var sugTotal=todos.reduce((s,x)=>s+((x.comprar||0)>0?(x.comprar*(x.cst||0)):0),0);
+var K=[['Itens com demanda',fmt(todos.length),''],
+['Cobertura &lt;30 dias',fmt(urgente30),urgente30?'al':''],
+['Cobertura &lt;60 dias',fmt(urgente60),urgente60?'al':''],
+['Sugestão de compra (R$)','R$ '+fmt(sugTotal,2),sugTotal?'al':'']];
+document.getElementById('demEstKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
+var r=applySort(todos.filter(x=>!q||(x.produto+x.ref)._nb().indexOf(q)>-1),'demEst');
+document.getElementById('tDemEst').innerHTML=r.length?r.map(function(x){
+var corCob=x.cob==null?'var(--mut)':(x.cob*30<30?'var(--rup)':x.cob*30<60?'#B7791F':'var(--ink)');
+return '<tr><td class="n">'+x.ref+'</td><td>'+x.produto+'</td><td class="n">'+fmt(x.dem,1)+'</td>'+
+'<td class="n">'+fmt(x.eat,0)+'</td><td class="n" style="color:'+corCob+';font-weight:700">'+(x.cob!=null?fmt(x.cob,2):'—')+'</td>'+
+'<td class="n">'+((x.comprar||0)>0?'<b>'+fmt(x.comprar,0)+'</b>':'—')+'</td><td>'+bdg(x.status)+'</td></tr>';}).join('')
+:'<tr><td colspan="7" class="muted" style="padding:14px">Nenhum item com demanda neste filtro.</td></tr>';
+document.getElementById('cDemEst').textContent=r.length+' itens · ordenado pela menor cobertura (mais urgente primeiro)';}
 
 // Reprocesso
 function rReproc(){var r=D.reproc||[];
@@ -2204,8 +2270,8 @@ function rDemGraf(){lineChart('volLine',D.meses,[
 {name:'Açaí',vals:D.vol.mix,color:C.acai},{name:'Cremes',vals:D.vol.cremes,color:C.berry},{name:'Gelato',vals:D.vol.gelatos,color:C.lil}],fMes);
 lineChart('diaLine',D.diaLabels||[],[
 {name:'Açaí',vals:D.dia.mix,color:C.acai},{name:'Cremes',vals:D.dia.cremes,color:C.berry},{name:'Gelato',vals:D.dia.gelatos,color:C.lil}],fDia);}
-function rDem(){var q=(document.getElementById('qDem').value||'').toLowerCase();
-var r=applySort(D.estoque.filter(x=>x.dem>0&&(!gDem||x.grupo==gDem)&&(!q||(x.produto+x.ref).toLowerCase().indexOf(q)>-1)),'dem');
+function rDem(){var q=(document.getElementById('qDem').value||'')._nb();
+var r=applySort(D.estoque.filter(x=>x.dem>0&&(!gDem||x.grupo==gDem)&&(!q||(x.produto+x.ref)._nb().indexOf(q)>-1)),'dem');
 document.getElementById('tDem').innerHTML=r.map(x=>'<tr><td class="n">'+x.ref+'</td><td>'+x.produto+'</td><td>'+
 (x.grupo||'—')+'</td><td class="n">'+fmt(x.dem,1)+'</td><td class="n">'+fmt(x.fsz,2)+'</td><td class="n">'+fmt(x.dias)+'</td></tr>').join('');
 document.getElementById('cDem').textContent=r.length+' produtos'+(gDem?' ('+gDem+')':'');}
@@ -2241,8 +2307,8 @@ if(pvMode=='anual'){prod=x.prodMes.reduce((s,v)=>s+v,0);vend=x.vendMes.reduce((s
 else if(pvMode=='mes'){var idx=pvSel.length?pvSel:x.prodMes.map((v,i)=>i);prod=0;vend=0;idx.forEach(i=>{prod+=x.prodMes[i]||0;vend+=x.vendMes[i]||0;});}
 else{prod=Math.round((x.prodAtual||0)/(D.pv.fracMes||1));vend=x.dem||0;}
 return {nome:x.nome,ref:x.ref,cat:x.cat,prod:prod,vend:vend,dif:prod-vend,atend:vend>0?Math.round(prod/vend*100):null};}
-function rPV(){var pv=D.pv;if(!pv)return;var q=(document.getElementById('qPV').value||'').toLowerCase();
-var r=pv.produtos.filter(x=>(!gPV||x.cat==gPV)&&(!q||(x.nome+x.ref).toLowerCase().indexOf(q)>-1)).map(calcRow);
+function rPV(){var pv=D.pv;if(!pv)return;var q=(document.getElementById('qPV').value||'')._nb();
+var r=pv.produtos.filter(x=>(!gPV||x.cat==gPV)&&(!q||(x.nome+x.ref)._nb().indexOf(q)>-1)).map(calcRow);
 var s=sortPVs;r.sort(function(a,b){var x=a[s.k],y=b[s.k];if(x==null)x=-Infinity;if(y==null)y=-Infinity;
 if(typeof x=='string')return s.asc?(''+x).localeCompare(y):(''+y).localeCompare(x);return s.asc?x-y:y-x;});
 document.getElementById('tPV').innerHTML=r.map(function(x){var col=x.atend==null?'':(x.atend<80?'color:#C0392B':x.atend>130?'color:#2A6FB0':'');
@@ -2254,6 +2320,28 @@ document.getElementById('pvNaoMap').innerHTML=pv.naoMap.length?('<div class="con
 function rSaz(){var pv=D.pv;if(!pv.sazonais||!pv.sazonais.length){document.getElementById('pvSaz').innerHTML='<div class="muted">Nenhum produto com sazonalidade forte.</div>';return;}
 document.getElementById('pvSaz').innerHTML='<div style="display:flex;flex-wrap:wrap;gap:8px">'+pv.sazonais.map(function(x){var alta=x.fsz>1;
 return '<span style="padding:5px 11px;border-radius:20px;font-size:12px;font-weight:600;background:'+(alta?'#EAF3EC':'#FCEEF0')+';color:'+(alta?'#2E7D5B':'#C0392B')+'">'+x.nome+' · '+(alta?'▲':'▼')+' '+fmt(x.fsz,2)+'×</span>';}).join('')+'</div>';}
+function rProdBusca(){var q=(document.getElementById('qProdBusca').value||'').trim()._nb();
+var box=document.getElementById('prodBuscaResult');
+if(!q||q.length<2){box.innerHTML='<p class="hint" style="margin:8px 0 0">Digite ao menos 2 letras do nome, ou a referência.</p>';return;}
+var pv=D.pv;
+if(!pv||!pv.produtos){box.innerHTML='<p class="muted" style="padding:10px">Sem dados de Produção × Venda (aba "Produção" vazia ou não lida).</p>';return;}
+var r=pv.produtos.filter(function(p){return (p.nome+' '+p.ref)._nb().indexOf(q)>-1;}).slice(0,8);
+if(!r.length){box.innerHTML='<p class="muted" style="padding:10px">Nenhum produto encontrado para "'+q+'".</p>';return;}
+var nMeses=pv.meses.length;
+box.innerHTML=r.map(function(p){
+var mediaProd=nMeses?Math.round(p.prodMes.reduce((a,b)=>a+b,0)/nMeses):0;
+var mediaVend=nMeses?Math.round(p.vendMes.reduce((a,b)=>a+b,0)/nMeses):0;
+var totProd=p.prodMes.reduce((a,b)=>a+b,0),totVend=p.vendMes.reduce((a,b)=>a+b,0);
+var linhas=pv.meses.map((m,i)=>'<tr><td>'+m.slice(5)+'/'+m.slice(0,4)+'</td><td class="n">'+fmt(p.prodMes[i])+'</td><td class="n">'+fmt(p.vendMes[i])+'</td></tr>').join('');
+return '<div class="tile" style="margin-top:10px;border-left:5px solid var(--berry)"><div class="th">'+p.nome+' <small>· ref '+p.ref+' · '+nMeses+' meses de histórico</small></div>'+
+'<div class="kpis" style="grid-template-columns:repeat(4,1fr)">'+
+'<div class="kpi"><div class="l">Média produzida/mês</div><div class="v">'+fmt(mediaProd)+'</div></div>'+
+'<div class="kpi"><div class="l">Média vendida/mês</div><div class="v">'+fmt(mediaVend)+'</div></div>'+
+'<div class="kpi"><div class="l">Total produzido</div><div class="v">'+fmt(totProd)+'</div></div>'+
+'<div class="kpi"><div class="l">Total vendido</div><div class="v">'+fmt(totVend)+'</div></div></div>'+
+'<div class="tablewrap" style="max-height:260px;margin-top:8px"><table><thead><tr><th>Mês</th><th>Produzido</th><th>Vendido</th></tr></thead><tbody>'+linhas+'</tbody></table></div></div>';
+}).join('');}
+
 function initPV(){if(!D.pv){document.getElementById('prodvenda').innerHTML='<h2 class="ttl">Produção / Venda</h2><p class="hint">Aba \"Produção\" não encontrada ou vazia.</p>';return;}
 var box=document.getElementById('pvMeses'),last=D.pv.meses.length-1;
 box.innerHTML='<span class="lbl">Meses</span>'+D.pv.meses.map((m,i)=>'<span class="chip'+(i==last?' on':'')+'" onclick="togMes('+i+',this)">'+m.slice(5,7)+'/'+m.slice(0,4)+'</span>').join('');
@@ -2336,69 +2424,74 @@ var txt='*📋 Conferência Física de Polpas*\n*Supremo Açaí* · '+dia+'\n\n'
 '\n\n*Resumo:* '+contadas+' polpa(s) contadas · Divergência total: '+fmt(divTot,0)+' un';
 window.open('https://wa.me/?text='+encodeURIComponent(txt),'_blank');}
 
-var custMes='',custF='',custExp={};
-function setCust(v,el){custF=v;el.parentNode.querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');rCust();}
-function setCustMes(m){custMes=m;custExp={};document.querySelectorAll('#custMeses .chip').forEach(c=>c.classList.toggle('on',c.dataset.m==m));rCust();}
-function toggReceita(i){custExp[i]=!custExp[i];rCust();}
+var custMes='',custFiltro='';
+function setCustMes(m){custMes=m;document.querySelectorAll('#custMeses .chip').forEach(c=>c.classList.toggle('on',c.dataset.m==m));rCust();}
+function setCustFiltro(f){custFiltro=custFiltro==f?'':f;rCust();}
 function rCust(){var c=D.custos;
-if(!c||!c.mesesLista||!c.mesesLista.length){document.getElementById('custKpis').innerHTML='<div class="kpi"><div class="l">Sem dados</div><div class="v">—</div></div>';
-document.getElementById('tCust').innerHTML='<tr><td colspan="7" class="muted" style="padding:14px">Aba "Produção com insumos" não encontrada ou vazia.</td></tr>';
+if(!c||!c.meses||!c.meses.length){document.getElementById('custKpis').innerHTML='<div class="kpi"><div class="l">Sem dados</div><div class="v">—</div></div>';
+document.getElementById('tCust').innerHTML='<tr><td colspan="8" class="muted" style="padding:14px">Aba "Produção com insumos" não encontrada ou vazia.</td></tr>';
 document.getElementById('custMeses').innerHTML='';return;}
-if(!custMes||c.mesesLista.indexOf(custMes)<0)custMes=c.mesesLista[c.mesesLista.length-1];
-// chips de mês
-document.getElementById('custMeses').innerHTML='<span class="lbl">Mês</span>'+c.mesesLista.map(m=>'<span class="chip'+(m==custMes?' on':'')+'" data-m="'+m+'" onclick="setCustMes(\''+m+'\')">'+m.slice(5)+'/'+m.slice(0,4)+'</span>').join('');
-var M=c.meses[custMes],recs=M.receitas;
-// KPIs do mês
-var comRec=recs.filter(r=>r.temRec);
-var desp=comRec.filter(r=>r.pct!=null&&r.pct>5);       // desperdício >5%
-var K=[['Custo real do mês','R$ '+fmt(M.custoTot,2),''],['Receitas produzidas',fmt(recs.length),''],
-['Receitas desperdiçando &gt;5%',fmt(desp.length),desp.length?'al':''],['Perda do mês (R$)','R$ '+fmt(M.perdaTot||0,2),(M.perdaTot||0)>0?'al':'']];
-document.getElementById('custKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
-// filtro
-var q=(document.getElementById('qCust').value||'').toLowerCase();
-var rr=recs.filter(function(r){
-if(q&&r.receita.toLowerCase().indexOf(q)<0)return false;
-if(custF=='desp')return r.temRec&&r.pct!=null&&r.pct>5;
-if(custF=='semrec')return !r.temRec;
-return true;});
-// tabela: linha de receita (clicável) + linhas de insumo quando expandida
-var html='';
-rr.forEach(function(r,idx){
-var cor=r.pct==null?'var(--mut)':(r.pct>15?'var(--rup)':r.pct>5?'#B7791F':r.pct<-5?'#2A6FB0':'var(--ok)');
-var pcttxt=r.pct==null?'<span title="receita não cadastrada">s/ receita</span>':(r.pct>0?'+':'')+fmt(r.pct,1)+'%';
-var seta=r.temRec?(custExp[idx]?'▾':'▸'):'';
-html+='<tr style="cursor:'+(r.temRec?'pointer':'default')+';background:var(--card)" onclick="toggReceita('+idx+')">'+
-'<td><b>'+seta+' '+r.receita+'</b><br><span style="font-size:10px;color:var(--mut)">'+fmt(r.prodUn)+' un produzidas'+(r.custoOutros?' · embalagem R$ '+fmt(r.custoOutros,0):'')+'</span></td>'+
-'<td class="n">'+fmt(r.real,1)+'</td><td class="n">'+(r.temRec?fmt(r.teo,1):'—')+'</td>'+
-'<td class="n" style="color:'+cor+';font-weight:700">'+(r.temRec?(r.dif>0?'+':'')+fmt(r.dif,1):'—')+'</td>'+
-'<td class="n" style="color:'+cor+';font-weight:700">'+pcttxt+'</td>'+
-'<td class="n" style="color:'+(r.perda>0?'var(--rup)':'var(--mut)')+';font-weight:700">'+(r.perda>0?'R$ '+fmt(r.perda,0):'—')+'</td>'+
-'<td class="n">'+brl(r.custo)+'</td></tr>';
-if(custExp[idx]&&r.temRec){
-r.insumos.forEach(function(i){
-var ic=i.pct==null?'var(--mut)':(i.pct>15?'var(--rup)':i.pct>5?'#B7791F':i.pct<-5?'#2A6FB0':'var(--ok)');
-var ipct=i.pct==null?'<span title="fora da ficha técnica (embalagem ou receita incompleta)">s/ ficha</span>':(i.pct>0?'+':'')+fmt(i.pct,1)+'%';
-var tituloExtra=i.isGrupo?' title="Marcas de polpa são intercambiáveis na produção — comparamos o total, não marca a marca"':'';
-html+='<tr style="background:var(--bg)"'+tituloExtra+'><td style="padding-left:24px;font-size:12px">'+i.nome+'</td>'+
-'<td class="n" style="font-size:12px">'+fmt(i.real,1)+'</td><td class="n" style="font-size:12px">'+(i.temTeo?fmt(i.teo,1):'—')+'</td>'+
-'<td class="n" style="font-size:12px;color:'+ic+'">'+(i.temTeo?(i.dif>0?'+':'')+fmt(i.dif,1):'—')+'</td>'+
-'<td class="n" style="font-size:12px;color:'+ic+';font-weight:600">'+ipct+'</td>'+
-'<td class="n" style="font-size:12px;color:'+(i.perda>0?'var(--rup)':'var(--mut)')+'">'+(i.perda>0?'R$ '+fmt(i.perda,0):'—')+'</td>'+
-'<td class="n" style="font-size:12px">'+brl(i.custo)+'</td></tr>';
-if(i.isGrupo&&i.subDetalhe&&i.subDetalhe.length){
-i.subDetalhe.forEach(function(s){
-html+='<tr style="background:var(--bg)"><td style="padding-left:44px;font-size:11px;color:var(--mut)">↳ '+s.nome+'</td>'+
-'<td class="n" style="font-size:11px;color:var(--mut)">'+fmt(s.real,1)+'</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td>'+
-'<td class="n" style="font-size:11px;color:var(--mut)">'+brl(s.custo)+'</td></tr>';});}});}});
-document.getElementById('tCust').innerHTML=html||'<tr><td colspan="7" class="muted" style="padding:14px">Nenhuma receita neste filtro.</td></tr>';
-document.getElementById('cCust').innerHTML='Clique numa receita para ver os insumos · O <b>% div.</b> compara só os ingredientes da ficha técnica (embalagens ficam no custo, fora do %) · <b>Perda R$</b> = excesso × custo do insumo · <b style="color:var(--rup)">+%</b>=desperdício · <b style="color:#2A6FB0">−%</b>=rendeu mais que a ficha · 🫐 Polpa é comparada em GRUPO (marcas variam por disponibilidade) — o ↳ mostra qual marca foi usada de fato';}
+if(!custMes||c.meses.indexOf(custMes)<0)custMes=c.meses[c.meses.length-1];
+document.getElementById('custMeses').innerHTML='<span class="lbl">Mês</span>'+c.meses.map(m=>'<span class="chip'+(m==custMes?' on':'')+'" data-m="'+m+'" onclick="setCustMes(\''+m+'\')">'+m.slice(5)+'/'+m.slice(0,4)+'</span>').join('');
+var idxMes=c.meses.indexOf(custMes),mesAnt=idxMes>0?c.meses[idxMes-1]:null;
+function acharSerie(p,mes){return mes?p.serie.find(s=>s.mes==mes):null;}
+var q=(document.getElementById('qCust').value||'')._nb();
+// monta uma linha por produto que tenha dado no mes atual OU no mes anterior
+// (senão um produto que sumiu da produção este mês fica invisível)
+var todas=c.produtos.filter(function(p){
+if(q&&(p.produto+' '+(p.ref||''))._nb().indexOf(q)<0)return false;
+return !!acharSerie(p,custMes)||!!acharSerie(p,mesAnt);
+}).map(function(p){
+var atual=acharSerie(p,custMes),ant=acharSerie(p,mesAnt);
+var custoAtual=atual?atual.custo:null,custoAnt=ant?ant.custo:null;
+var vendAtual=atual?atual.vendas:null,vendAnt=ant?ant.vendas:null;
+var dCusto=(custoAnt!=null&&custoAnt>0&&custoAtual!=null)?(custoAtual-custoAnt)/custoAnt*100:null;
+var dVend=(vendAnt!=null&&vendAnt>0&&vendAtual!=null)?(vendAtual-vendAnt)/vendAnt*100:null;
+var pct=atual?atual.pct:null;
+return {p:p,atual:atual,ant:ant,custoAtual:custoAtual,custoAnt:custoAnt,vendAtual:vendAtual,vendAnt:vendAnt,dCusto:dCusto,dVend:dVend,pct:pct};});
+// KPIs (totais sempre sobre TODOS os produtos do mês, independente do filtro ativo)
+var custoTotalAtual=todas.reduce((s,l)=>s+(l.custoAtual||0),0);
+var custoTotalAnt=todas.reduce((s,l)=>s+(l.custoAnt||0),0);
+var ganhando=todas.filter(l=>l.dVend!=null&&l.dVend>5).length;
+var perdendo=todas.filter(l=>l.dVend!=null&&l.dVend<-5).length;
+var divergindo=todas.filter(l=>l.pct!=null&&Math.abs(l.pct)>5).length;
+var K=[['custo','Custo total (mês)','R$ '+fmt(custoTotalAtual,2)],
+['anterior','Custo total (mês anterior)','R$ '+fmt(custoTotalAnt,2)],
+['ganhando','Ganhando força (venda &gt;5%)',fmt(ganhando)],
+['perdendo','Perdendo força (venda &lt;-5%)',fmt(perdendo)],
+['divergencia','Divergência de receita (&gt;5%)',fmt(divergindo)]];
+document.getElementById('custKpis').innerHTML=K.map(k=>'<div class="kpi kpi-click'+(custFiltro==k[0]?' kpi-on':'')+(k[0]=='perdendo'&&perdendo?' al':'')+'" onclick="setCustFiltro(\''+k[0]+'\')"><div class="l">'+k[1]+'</div><div class="v">'+k[2]+'</div></div>').join('');
+// aplica o filtro ativo
+var linhas=todas.slice();
+if(custFiltro=='anterior'){linhas=linhas.filter(l=>l.ant);linhas.sort((a,b)=>(b.custoAnt||0)-(a.custoAnt||0));}
+else if(custFiltro=='ganhando'){linhas=linhas.filter(l=>l.dVend!=null&&l.dVend>5);linhas.sort((a,b)=>b.dVend-a.dVend);}
+else if(custFiltro=='perdendo'){linhas=linhas.filter(l=>l.dVend!=null&&l.dVend<-5);linhas.sort((a,b)=>a.dVend-b.dVend);}
+else if(custFiltro=='divergencia'){linhas=linhas.filter(l=>l.pct!=null&&Math.abs(l.pct)>5);linhas.sort((a,b)=>Math.abs(b.pct)-Math.abs(a.pct));}
+else{linhas=linhas.filter(l=>l.atual);linhas.sort((a,b)=>(b.custoAtual||0)-(a.custoAtual||0));}
+document.getElementById('tCust').innerHTML=linhas.length?linhas.map(function(l){
+var p=l.p,pct=l.pct;
+var corC=l.dCusto==null?'var(--mut)':(l.dCusto>10?'var(--rup)':l.dCusto<-10?'var(--ok)':'var(--ink)');
+var corV=l.dVend==null?'var(--mut)':(l.dVend>5?'var(--ok)':l.dVend<-5?'var(--rup)':'var(--ink)');
+var setaV=l.dVend==null?'':(l.dVend>0?'▲ ':'▼ ');
+var corPct=pct==null?'var(--mut)':(Math.abs(pct)>15?'var(--rup)':Math.abs(pct)>5?'#B7791F':'var(--ok)');
+var sumiu=!l.atual&&l.ant?' <span style="font-size:10px;color:var(--rup)" title="não produzido no mês selecionado">⚠ sumiu esse mês</span>':'';
+return '<tr>'+
+'<td><b>'+p.produto+'</b>'+sumiu+(p.receita?'<br><span style="font-size:10px;color:var(--mut)">ficha: '+p.receita+'</span>':'<br><span style="font-size:10px;color:var(--rup)">sem ficha técnica</span>')+'</td>'+
+'<td class="n">'+(l.custoAtual!=null?brl(l.custoAtual):'—')+'</td>'+
+'<td class="n">'+(l.custoAnt!=null?brl(l.custoAnt):'—')+'</td>'+
+'<td class="n" style="color:'+corC+';font-weight:700">'+(l.dCusto!=null?(l.dCusto>0?'+':'')+fmt(l.dCusto,1)+'%':'—')+'</td>'+
+'<td class="n">'+(l.vendAtual!=null?fmt(l.vendAtual):'—')+'</td>'+
+'<td class="n">'+(l.vendAnt!=null?fmt(l.vendAnt):'—')+'</td>'+
+'<td class="n" style="color:'+corV+';font-weight:700">'+(l.dVend!=null?setaV+(l.dVend>0?'+':'')+fmt(l.dVend,1)+'%':'—')+'</td>'+
+'<td class="n" style="color:'+corPct+'">'+(pct!=null?(pct>0?'+':'')+fmt(pct,1)+'%':'—')+'</td></tr>';
+}).join(''):'<tr><td colspan="8" class="muted" style="padding:14px">Nenhum produto neste filtro/mês.</td></tr>';
+document.getElementById('cCust').innerHTML='Clique nos indicadores acima para filtrar · <b style="color:var(--ok)">▲</b> ganhando força de venda · <b style="color:var(--rup)">▼</b> perdendo força · <b>"sumiu esse mês"</b> = tinha custo no mês anterior mas não foi produzido no mês selecionado · <b>Consumo vs Ficha</b> = real × teórico da receita (informativo)';}
 
 // Inventário
 function rInv(){var v=D.inventario;
 if(!v||!v.itens||!v.itens.length){document.getElementById('invKpis').innerHTML='<div class="kpi"><div class="l">Sem contagem lançada</div><div class="v">—</div></div>';
-document.getElementById('tInv').innerHTML='<tr><td colspan="8" class="muted" style="padding:14px">Lance a contagem na aba "Inventário" da planilha (Referência, Produto, Qtd Contada, Data, Observação).</td></tr>';return;}
-var K=[['Perda de Inventário','R$ '+fmt(Math.abs(v.perdaInventarioTotal),0),v.perdaInventarioTotal<0?'al':''],
-['Perda de Produção (itens contados)','R$ '+fmt(v.perdaProducaoConhecida,0),v.perdaProducaoConhecida>0?'al':''],
+document.getElementById('tInv').innerHTML='<tr><td colspan="7" class="muted" style="padding:14px">Lance a contagem na aba "Inventário" da planilha (Referência, Produto, Qtd Contada, Data, Observação).</td></tr>';return;}
+var K=[['Diferença de Inventário','R$ '+fmt(Math.abs(v.perdaInventarioTotal),0),v.perdaInventarioTotal<0?'al':''],
 ['Itens contados',fmt(v.nContados),''],
 ['Sem cadastro no sistema',fmt(v.nSemCadastro),v.nSemCadastro?'al':'']];
 document.getElementById('invKpis').innerHTML=K.map(k=>'<div class="kpi '+k[2]+'"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
@@ -2406,18 +2499,16 @@ document.getElementById('tInv').innerHTML=v.itens.map(function(i){
 var corDif=i.difRs==null?'var(--mut)':(i.difRs<-1?'var(--rup)':i.difRs>1?'#2A6FB0':'var(--ok)');
 var nome=i.nomeCad||i.nomeInformado||'—';
 var semCad=!i.temCad?' <span style="font-size:10px;color:var(--rup)" title="não achou cadastro correspondente">⚠ s/ cadastro</span>':'';
-var polpaTag=i.ehGrupoPolpa?' <span style="font-size:10px;color:var(--mut)" title="polpa é rastreada em grupo — perda de produção não é atribuível por marca individual">🫐 grupo</span>':'';
-return '<tr><td>'+nome+semCad+polpaTag+'</td><td class="n">'+(i.ref||'—')+'</td>'+
+return '<tr><td>'+nome+semCad+'</td><td class="n">'+(i.ref||'—')+'</td>'+
 '<td class="n">'+(i.teorico!=null?fmt(i.teorico,1):'—')+'</td><td class="n">'+fmt(i.contado,1)+'</td>'+
 '<td class="n" style="color:'+corDif+';font-weight:700">'+(i.difUn!=null?(i.difUn>0?'+':'')+fmt(i.difUn,1):'—')+'</td>'+
 '<td class="n" style="color:'+corDif+';font-weight:700">'+(i.difRs!=null?brl(i.difRs):'—')+'</td>'+
-'<td class="n" style="color:'+(i.perdaProducao>0?'var(--rup)':'var(--mut)')+'">'+(i.perdaProducao!=null?(i.perdaProducao>0?brl(i.perdaProducao):'—'):'—')+'</td>'+
 '<td style="font-size:12px;color:var(--mut)">'+(i.obs||'')+' '+(i.data?'· '+i.data:'')+'</td></tr>';}).join('');
-document.getElementById('cInv').innerHTML='<b style="color:var(--rup)">Perda de Inventário</b> = contado abaixo do teórico do sistema — não explicada por nenhum lançamento (investigar: furto, quebra, erro de contagem) · '+
-'<b style="color:var(--rup)">Perda de Produção conhecida</b> = já rastreada na aba Custos (insumo lançado a mais que a ficha) — corrigir na FICHA/processo, não no ajuste de estoque · '+
-'as duas <b>somam</b>, não se cancelam';}
+document.getElementById('cInv').innerHTML='Diferença = contado abaixo do teórico do sistema — não explicada por nenhum lançamento (investigar: furto, quebra, erro de contagem anterior)';}
 
-try{rCockpit();rGeral();rCmp();rEst();rPlano();rConf();rPolpa();rMeta();rVisao();rDemGraf();rDem();rCust();rInv();initPV();}catch(e){
+try{if(window.innerWidth>760){try{if(localStorage.getItem('sbCollapsed')=='1')document.getElementById('sidebar').classList.add('collapsed');}catch(e){}}
+try{if(localStorage.getItem('tema')=='dark'){document.documentElement.setAttribute('data-theme','dark');document.getElementById('btnTema').textContent='☀️';}}catch(e){}
+rCockpit();rGeral();rCmp();rEst();rPlano();rConf();rPolpa();rMeta();rVisao();rDemGraf();rDem();rCust();rInv();initPV();}catch(e){
 document.body.insertAdjacentHTML('afterbegin','<pre style="color:#C0392B;padding:12px">Erro: '+e+'</pre>');}
 </script></body></html>"""
 
@@ -2474,14 +2565,14 @@ def construir(cli):
         print(f"[aviso] reprocesso falhou: {_e}")
         reproc = []
     try:
-        custos = analise_real_vs_teorico(pl_e, master, rec_por_aba)
+        custos = analise_produto_mensal(pl_e, master, rec_por_aba, mensal)
     except Exception as _e:
         import traceback as _tb
         print(f"[aviso] análise de custos falhou: {_e}")
         _tb.print_exc()
         custos = None
     try:
-        inventario = analise_inventario(pl_e, master, custos)
+        inventario = analise_inventario(pl_e, master)
     except Exception as _e:
         print(f"[aviso] análise de inventário falhou: {_e}")
         inventario = None
