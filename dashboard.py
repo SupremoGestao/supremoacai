@@ -1,3 +1,4 @@
+# teste via claude code
 """
 dashboard.py — App de gestão do Supremo Açaí (estoque + produção/MRP)
 =====================================================================
