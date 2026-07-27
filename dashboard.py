@@ -2598,3 +2598,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# teste de integracao git direto pelo terminal
